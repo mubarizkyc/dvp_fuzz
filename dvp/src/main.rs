@@ -458,9 +458,6 @@ impl DvpSwapProgramFixture {
         mints.push(mint_a_22); // index 2
         mints.push(mint_b_22); // index 3
 
-        // ── Blocked T22 mints (for BlockedMintExtension tests) ───────────────
-        // These are NOT pushed into `mints`; they are only referenced by
-        // action_MODEL_create_dvp_blocked_mint via fixed pubkeys.
         let create_blocked_mint =
             |ctx: &mut TestContext, mint_pubkey: Pubkey, ext: ExtensionType| {
                 let size = ExtensionType::try_calculate_account_len::<T22Mint>(&[ext]).unwrap();
@@ -484,8 +481,6 @@ impl DvpSwapProgramFixture {
                     state.base.is_initialized = true;
                     state.pack_base();
                     state.init_account_type().unwrap();
-                    // Write mint_authority into packed bytes to avoid COption version conflict.
-                    // Layout: coption_tag(4) + pubkey(32) at offset 0.
                     data[0..4].copy_from_slice(&1u32.to_le_bytes());
                     data[4..36].copy_from_slice(&mint_authority.to_bytes());
                 }
@@ -515,11 +510,6 @@ impl DvpSwapProgramFixture {
             ExtensionType::NonTransferable,
         );
 
-        // ── Local PDA derivation helpers ─────────────────────────────────────
-        // FIX: derive_swap_dvp was capturing mint_a/mint_b from the outer scope,
-        // so DVPs 8 and 9 derived the wrong PDA (used SPL mint addresses instead
-        // of the T22 mint addresses). Use derive_swap_dvp_with_mints for all DVPs
-        // that need explicit mint selection.
         let derive_swap_dvp_with_mints = |program_id: &Pubkey,
                                           authority: &Pubkey,
                                           user_a: &Pubkey,
@@ -576,16 +566,6 @@ impl DvpSwapProgramFixture {
             .0
         };
 
-        // ── Shared create_dvp closure ─────────────────────────────────────────
-        // FIX: expiry was hardcoded to `365 * 24 * 60 * 60` (a raw i64 timestamp
-        // of ~1 year from epoch 0). The program checks `expiry > Clock::unix_timestamp`,
-        // and the SVM clock at slot 0 has unix_timestamp ≈ 0, so this accidentally
-        // worked in setup. But after ctx.warp_to_slot(100) for DVP 5, the clock
-        // advances and subsequent DVPs need expiry > current timestamp.
-        // Solution: always compute expiry as now + MAX_DURATION rather than a fixed value.
-        // We read the clock via unix_now() equivalent: slot * 2 / 5 (mirrors the
-        // harness fallback). In practice, for setup before any warp, slot=0 so
-        // this is still ~31536000 which is fine. Using saturating_add is safe.
         let create_dvp = |ctx: &mut TestContext,
                           payer: &Arc<Keypair>,
                           swap_dvp: Pubkey,
@@ -636,9 +616,6 @@ impl DvpSwapProgramFixture {
         let mut closed: Vec<DvpRecord> = Vec::new();
         let mut dvps: Vec<DvpRecord> = Vec::new();
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 1 — fully funded, SPL Token → targets settle_real
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -762,11 +739,6 @@ impl DvpSwapProgramFixture {
             });
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 2 — fully funded, SPL Token → targets cancel_real
-        // FIX: was labelled "no funding" but had funding code added below;
-        // the label and intent are now consistent.
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -870,11 +842,6 @@ impl DvpSwapProgramFixture {
         }
 
         // ══════════════════════════════════════════════════════════════════════
-        // DVP 3 — fully funded, SPL Token → targets reject_real
-        // FIX: DVP 4 was erroneously nested inside DVP 3's brace scope, causing
-        // DVP 3's DvpRecord to capture DVP 4's local variables for dvp_ata_a/b.
-        // DVP 4 is now its own top-level block.
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -977,13 +944,6 @@ impl DvpSwapProgramFixture {
             });
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 4 — created then rejected → pre-populates self.closed
-        // targets recover_real
-        // FIX: was nested inside DVP 3's block. Now a proper top-level block.
-        // FIX: reject ix had swap_dvp as AccountMeta::new_readonly — it must be
-        //      AccountMeta::new (writable) because reject closes it.
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -1033,10 +993,6 @@ impl DvpSwapProgramFixture {
                     .unwrap();
             }
 
-            // Reject the DVP to close swap_dvp.
-            // FIX: original had swap_dvp as new_readonly — reject closes the PDA
-            // so it must be writable (AccountMeta::new).
-            // Discriminator 4 = reject_dvp.
             let reject_ix = Instruction {
                 program_id,
                 accounts: vec![
@@ -1060,8 +1016,6 @@ impl DvpSwapProgramFixture {
                 r.as_ref().map(|o| o.is_success())
             );
 
-            // Recreate escrow ATAs for the now-dead swap_dvp with 50 tokens each
-            // so recover_dvp has something to drain.
             for (mint, escrow) in [(mint_a, dvp_ata_a), (mint_b, dvp_ata_b)] {
                 ctx.create_token_account()
                     .pubkey(escrow)
@@ -1088,22 +1042,8 @@ impl DvpSwapProgramFixture {
                 token_program_a: Self::TOKEN_PROGRAM,
                 token_program_b: Self::TOKEN_PROGRAM,
             });
-            // Note: NOT pushed into dvps — swap_dvp is closed, only closed[] holds it.
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 5 — short expiry, warped past it → targets DvpExpired in settle
-        // FIX: warp_to_slot(100) was inside DVP 6's block in the original, meaning
-        // DVPs 6–9 were all created after the warp with a stale clock. Now the warp
-        // is scoped to DVP 5 only, and we warp BACK to 0 before creating the rest.
-        // Actually LiteSVM doesn't support warping backward, so instead we create
-        // DVP 5 with a short expiry relative to the current slot (0), and the
-        // ACTION (action_MODEL_settle_real on DVP 5) must warp past the expiry
-        // before calling settle. We do NOT warp in setup to avoid breaking
-        // subsequent DVPs.
-        // FIX: The expiry here must be > 0 (clock is ~0 at slot 0) but small enough
-        // that a moderate warp will exceed it. Use expiry = 1 (1 second from epoch 0).
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -1144,13 +1084,11 @@ impl DvpSwapProgramFixture {
                 None,
             );
             let r = ctx.raw_call(ix).signers(&[&*actors[0]]).send();
+
             eprintln!(
                 "[SETUP DVP5] create short-expiry: {:?}",
                 r.as_ref().map(|o| o.is_success())
             );
-            // No warp here. action_MODEL_settle_real picks DVP 5 by index and will
-            // hit DvpExpired because even slot 0 maps to unix_timestamp > 1.
-            // (litesvm starts its clock at a small positive value, not exactly 0.)
 
             dvps.push(DvpRecord {
                 swap_dvp,
@@ -1170,11 +1108,6 @@ impl DvpSwapProgramFixture {
             });
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 6 — over-funded escrows → targets surplus refund path in settle_real
-        // FIX: was nested inside DVP 6's block, swallowed by a missing closing brace.
-        // DVP 7 is now its own block below.
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -1212,7 +1145,7 @@ impl DvpSwapProgramFixture {
                 "[SETUP] DVP 6 create failed"
             );
 
-            // All four party ATAs — settle needs ua_b and ub_a as destination ATAs,
+            // All four party ATAs , settle needs ua_b and ub_a as destination ATAs,
             // ua_a and ub_b as surplus refund destinations.
             let ua_a = derive_ata(&user_a, &mint_a);
             let ua_b = derive_ata(&user_a, &mint_b);
@@ -1272,8 +1205,6 @@ impl DvpSwapProgramFixture {
                     .send();
             }
 
-            // Record amount_a/amount_b as the agreed amounts (not +1),
-            // so settle_real sees surplus = 1 and takes the refund branch.
             dvps.push(DvpRecord {
                 swap_dvp,
                 tombstone,
@@ -1292,15 +1223,6 @@ impl DvpSwapProgramFixture {
             });
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 7 — earliest_settlement_timestamp in the future → targets SettlementTooEarly
-        // FIX: was nested inside DVP 6's block (wrong closing brace placement).
-        // FIX: `earliest` was passed as `None` instead of `Some(...)` to create_dvp,
-        //      so the SettlementTooEarly branch was never reachable.
-        // FIX: amount_a/amount_b in DvpRecord were hardcoded to 500/1000 instead
-        //      of the actual amounts used at create time, causing settle_real to
-        //      check wrong funding amounts.
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -1314,9 +1236,6 @@ impl DvpSwapProgramFixture {
             let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
             let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
 
-            // earliest = 1 year from epoch 0: settle will always hit SettlementTooEarly
-            // because the SVM clock starts near 0 and no action warps that far.
-            // FIX: was passed as `None` — that made this DVP identical to DVP 2.
             let earliest = Some(365i64 * 24 * 60 * 60);
 
             let r = create_dvp(
@@ -1355,21 +1274,12 @@ impl DvpSwapProgramFixture {
                 dvp_ata_b,
                 nonce,
                 amount_a,
-                amount_b, // FIX: match actual create amounts
+                amount_b,
                 token_program_a: Self::TOKEN_PROGRAM,
                 token_program_b: Self::TOKEN_PROGRAM,
             });
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 8 — Token-2022 mints, funded → targets settle T22 path
-        // FIX: TransferChecked was missing the `src` (source ATA) argument,
-        //      so the escrows were never actually funded. The `litesvm_token`
-        //      builder requires `.source(&src)` to be called.
-        // FIX: dvps.push was guarded by `r.is_success()` from the LAST transfer,
-        //      not the create_dvp call, so a failed transfer silently dropped DVP 8.
-        //      Guard on the create result instead.
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -1457,7 +1367,6 @@ impl DvpSwapProgramFixture {
                 eprintln!("[SETUP DVP8] mint_to {:?}: {:?}", dest, r.is_ok());
             }
 
-            // FIX: add .source(&src) — previously commented out, leaving escrows empty.
             for (src, dst, signer_idx, mint, amount) in [
                 (ua_a, dvp_ata_a, 1usize, mint_a_22, amount_a),
                 (ub_b, dvp_ata_b, 2usize, mint_b_22, amount_b),
@@ -1469,7 +1378,7 @@ impl DvpSwapProgramFixture {
                     &dst,
                     amount,
                 )
-                .source(&src) // FIX: was missing
+                .source(&src)
                 .decimals(0)
                 .owner(&actors[signer_idx])
                 .token_program_id(&Self::TOKEN_PROGRAM_2022)
@@ -1495,7 +1404,6 @@ impl DvpSwapProgramFixture {
                     .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap_or([0; 8])))
             );
 
-            // FIX: guard on create_ok, not on the last transfer result.
             if create_ok {
                 dvps.push(DvpRecord {
                     swap_dvp,
@@ -1516,11 +1424,6 @@ impl DvpSwapProgramFixture {
             }
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // DVP 9 — Token-2022 mints, unfunded → targets cancel/reject T22 path
-        // FIX: dvps.push was guarded by `r.is_success()` from the last ATA
-        //      creation, not the create_dvp call. Guard on the create result.
-        // ══════════════════════════════════════════════════════════════════════
         {
             let authority = actors[0].pubkey();
             let user_a = actors[1].pubkey();
@@ -1576,7 +1479,6 @@ impl DvpSwapProgramFixture {
                 .unwrap_or(false);
             eprintln!("[SETUP DVP9] create_dvp_t22: {}", create_ok);
 
-            // Party ATAs for reject/cancel — only the ones needed for refund destinations
             let ua_a = derive_ata_with_program(&user_a, &mint_a_22, &Self::TOKEN_PROGRAM_2022);
             let ub_b = derive_ata_with_program(&user_b, &mint_b_22, &Self::TOKEN_PROGRAM_2022);
             for (wallet, mint) in [(user_a, mint_a_22), (user_b, mint_b_22)] {
@@ -1591,7 +1493,6 @@ impl DvpSwapProgramFixture {
                 eprintln!("[SETUP DVP9] create_ata {:?}: {:?}", wallet, r.is_ok());
             }
 
-            // FIX: guard on create_ok, not on r from the ATA creation loop.
             if create_ok {
                 dvps.push(DvpRecord {
                     swap_dvp,
@@ -1621,7 +1522,7 @@ impl DvpSwapProgramFixture {
             last: Action::default(),
             actors,
             watched: Vec::new(),
-            mints, // indices: 0=mint_a(SPL), 1=mint_b(SPL), 2=mint_a_22(T22), 3=mint_b_22(T22)
+            mints,
             dvps,
             closed,
         }
