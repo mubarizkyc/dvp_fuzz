@@ -15,7 +15,18 @@ use spl_token_2022::{
     state::Mint as T22Mint,
 };
 use std::sync::Arc;
-
+mod fuzz_utils;
+mod ix_builder;
+mod setup_utils;
+use fuzz_utils::{note_blocked, note_landed, Action, DvpRecord};
+use ix_builder::{
+    build_cancel_dvp_ix, build_create_dvp_ix, build_reclaim_dvp_ix, build_recover_dvp_ix,
+    build_reject_dvp_ix, build_settle_dvp_ix,
+};
+use setup_utils::{
+    setup_dvp_closed, setup_dvp_earliest, setup_dvp_funded, setup_dvp_mixed,
+    setup_dvp_partial_funded, setup_dvp_short_expiry, setup_dvp_unfunded,
+};
 const SYSTEM_PROGRAM: Pubkey = Pubkey::new_from_array([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ]);
@@ -25,357 +36,7 @@ const PROGRAM_ID: Pubkey = Pubkey::new_from_array([
 ]);
 const FUNDED: u64 = 100000000000; // what create_actor gives each actor
 const MAX_ACTORS: usize = 8; // a bound, not a choice: the
-const WATCHED_MAX: usize = 48; // accounts snapshot() carries
-                               // fixture is cloned every iteration, so an unbounded Vec would grow without limit
-thread_local! {
-    static BLOCKED_SEEN: std::cell::RefCell<std::collections::HashSet<(&'static str, i64)>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-    static LANDED_SEEN: std::cell::RefCell<std::collections::HashSet<&'static str>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-}
-fn note_landed(action: &'static str) {
-    LANDED_SEEN.with(|seen| {
-        if seen.borrow_mut().insert(action) {
-            eprintln!("[LANDED] {}", action);
-        }
-    });
-}
-//function:updated(mubariz) emit logs ,for human debugging
-/// Say what blocked an action, the first time this thread sees that pair.
-///
-/// -1 means it never reached the SVM (a signature the fixture could not produce);
-/// -2 means it failed with no Anchor code, which is a runtime error rather than a
-/// guard - a missing account, usually.
-fn note_blocked(action: &'static str, code: i64, detail: &dyn std::fmt::Debug) {
-    BLOCKED_SEEN.with(|seen| {
-        if seen.borrow_mut().insert((action, code)) {
-            match code {
-                -1 => eprintln!(
-                    "[BLOCKED] {} -> not submitted\n  detail: {:?}",
-                    action, detail
-                ),
-                -2 => eprintln!(
-                    "[BLOCKED] {} -> failed with no error code\n  detail: {:?}",
-                    action, detail
-                ),
-                c if c >= 6000 => eprintln!(
-                    "[BLOCKED] {} -> Custom({}) = error enum variant #{}\n  detail: {:?}",
-                    action,
-                    c,
-                    c - 6000,
-                    detail
-                ),
-                c => eprintln!(
-                    "[BLOCKED] {} -> Custom({})\n  detail: {:?}",
-                    action, c, detail
-                ),
-            }
-        }
-    });
-}
-
-/// `create_dvp` — args: amount_a, amount_b, expiry_timestamp, nonce, ref_string, user_a_settlement_destination, user_b_settlement_destination, earliest_settlement_timestamp
-fn build_create_dvp_ix(
-    program_id: Pubkey,
-    payer: Pubkey,
-    swap_dvp: Pubkey,
-    nonce_tombstone: Pubkey,
-    settlement_authority: Pubkey,
-    user_a: Pubkey,
-    user_b: Pubkey,
-    mint_a: Pubkey,
-    mint_b: Pubkey,
-    dvp_ata_a: Pubkey,
-    dvp_ata_b: Pubkey,
-    token_program_a: Pubkey,
-    token_program_b: Pubkey,
-    associated_token_program: Pubkey,
-    amount_a: u64,
-    amount_b: u64,
-    expiry_timestamp: i64,
-    nonce: u64,
-    ref_string: Option<String>,
-    user_a_settlement_destination: Option<[u8; 32]>,
-    user_b_settlement_destination: Option<[u8; 32]>,
-    earliest_settlement_timestamp: Option<i64>,
-) -> Instruction {
-    let mut data: Vec<u8> = vec![0];
-    data.extend_from_slice(&amount_a.to_le_bytes());
-    data.extend_from_slice(&amount_b.to_le_bytes());
-    data.extend_from_slice(&expiry_timestamp.to_le_bytes());
-    data.extend_from_slice(&nonce.to_le_bytes());
-    data.extend_from_slice(&borsh::to_vec(&ref_string).unwrap());
-    data.extend_from_slice(&borsh::to_vec(&user_a_settlement_destination).unwrap());
-    data.extend_from_slice(&borsh::to_vec(&user_b_settlement_destination).unwrap());
-    data.extend_from_slice(&borsh::to_vec(&earliest_settlement_timestamp).unwrap());
-    let accounts = vec![
-        AccountMeta::new(payer, true),
-        AccountMeta::new(swap_dvp, false),
-        AccountMeta::new(nonce_tombstone, false),
-        AccountMeta::new_readonly(settlement_authority, false),
-        AccountMeta::new_readonly(user_a, false),
-        AccountMeta::new_readonly(user_b, false),
-        AccountMeta::new_readonly(mint_a, false),
-        AccountMeta::new_readonly(mint_b, false),
-        AccountMeta::new(dvp_ata_a, false),
-        AccountMeta::new(dvp_ata_b, false),
-        AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
-        AccountMeta::new_readonly(token_program_a, false),
-        AccountMeta::new_readonly(token_program_b, false),
-        AccountMeta::new_readonly(associated_token_program, false),
-    ];
-    Instruction {
-        program_id,
-        accounts,
-        data,
-    }
-}
-
-/// `reclaim_dvp` — no arguments
-fn build_reclaim_dvp_ix(
-    program_id: Pubkey,
-    signer: Pubkey,
-    swap_dvp: Pubkey,
-    mint: Pubkey,
-    dvp_source_ata: Pubkey,
-    signer_dest_ata: Pubkey,
-    token_program: Pubkey,
-    memo_program: Pubkey,
-) -> Instruction {
-    let mut data: Vec<u8> = vec![1];
-    let accounts = vec![
-        AccountMeta::new_readonly(signer, true),
-        AccountMeta::new_readonly(swap_dvp, false),
-        AccountMeta::new_readonly(mint, false),
-        AccountMeta::new(dvp_source_ata, false),
-        AccountMeta::new(signer_dest_ata, false),
-        AccountMeta::new_readonly(token_program, false),
-        AccountMeta::new_readonly(memo_program, false),
-    ];
-    Instruction {
-        program_id,
-        accounts,
-        data,
-    }
-}
-
-/// `settle_dvp` — args: leg_a_extras_count
-fn build_settle_dvp_ix(
-    program_id: Pubkey,
-    settlement_authority: Pubkey,
-    swap_dvp: Pubkey,
-    mint_a: Pubkey,
-    mint_b: Pubkey,
-    dvp_ata_a: Pubkey,
-    dvp_ata_b: Pubkey,
-    user_a_destination_ata_b: Pubkey,
-    user_b_destination_ata_a: Pubkey,
-    user_a_ata_a: Pubkey,
-    user_b_ata_b: Pubkey,
-    token_program_a: Pubkey,
-    token_program_b: Pubkey,
-    memo_program: Pubkey,
-    leg_a_extras_count: u8,
-) -> Instruction {
-    let mut data: Vec<u8> = vec![2];
-    data.extend_from_slice(&leg_a_extras_count.to_le_bytes());
-    let accounts = vec![
-        AccountMeta::new(settlement_authority, true),
-        AccountMeta::new(swap_dvp, false),
-        AccountMeta::new_readonly(mint_a, false),
-        AccountMeta::new_readonly(mint_b, false),
-        AccountMeta::new(dvp_ata_a, false),
-        AccountMeta::new(dvp_ata_b, false),
-        AccountMeta::new(user_a_destination_ata_b, false),
-        AccountMeta::new(user_b_destination_ata_a, false),
-        AccountMeta::new(user_a_ata_a, false),
-        AccountMeta::new(user_b_ata_b, false),
-        AccountMeta::new_readonly(token_program_a, false),
-        AccountMeta::new_readonly(token_program_b, false),
-        AccountMeta::new_readonly(memo_program, false),
-    ];
-    Instruction {
-        program_id,
-        accounts,
-        data,
-    }
-}
-
-/// `cancel_dvp` — args: leg_a_extras_count
-fn build_cancel_dvp_ix(
-    program_id: Pubkey,
-    settlement_authority: Pubkey,
-    swap_dvp: Pubkey,
-    mint_a: Pubkey,
-    mint_b: Pubkey,
-    dvp_ata_a: Pubkey,
-    dvp_ata_b: Pubkey,
-    user_a_ata_a: Pubkey,
-    user_b_ata_b: Pubkey,
-    token_program_a: Pubkey,
-    token_program_b: Pubkey,
-    memo_program: Pubkey,
-    leg_a_extras_count: u8,
-) -> Instruction {
-    let mut data: Vec<u8> = vec![3];
-    data.extend_from_slice(&leg_a_extras_count.to_le_bytes());
-    let accounts = vec![
-        AccountMeta::new(settlement_authority, true),
-        AccountMeta::new(swap_dvp, false),
-        AccountMeta::new_readonly(mint_a, false),
-        AccountMeta::new_readonly(mint_b, false),
-        AccountMeta::new(dvp_ata_a, false),
-        AccountMeta::new(dvp_ata_b, false),
-        AccountMeta::new(user_a_ata_a, false),
-        AccountMeta::new(user_b_ata_b, false),
-        AccountMeta::new_readonly(token_program_a, false),
-        AccountMeta::new_readonly(token_program_b, false),
-        AccountMeta::new_readonly(memo_program, false),
-    ];
-    Instruction {
-        program_id,
-        accounts,
-        data,
-    }
-}
-
-/// `reject_dvp` — args: leg_a_extras_count
-fn build_reject_dvp_ix(
-    program_id: Pubkey,
-    signer: Pubkey,
-    swap_dvp: Pubkey,
-    mint_a: Pubkey,
-    mint_b: Pubkey,
-    dvp_ata_a: Pubkey,
-    dvp_ata_b: Pubkey,
-    user_a_ata_a: Pubkey,
-    user_b_ata_b: Pubkey,
-    token_program_a: Pubkey,
-    token_program_b: Pubkey,
-    memo_program: Pubkey,
-    leg_a_extras_count: u8,
-) -> Instruction {
-    let mut data: Vec<u8> = vec![4];
-    data.extend_from_slice(&leg_a_extras_count.to_le_bytes());
-    let accounts = vec![
-        AccountMeta::new(signer, true),
-        AccountMeta::new(swap_dvp, false),
-        AccountMeta::new_readonly(mint_a, false),
-        AccountMeta::new_readonly(mint_b, false),
-        AccountMeta::new(dvp_ata_a, false),
-        AccountMeta::new(dvp_ata_b, false),
-        AccountMeta::new(user_a_ata_a, false),
-        AccountMeta::new(user_b_ata_b, false),
-        AccountMeta::new_readonly(token_program_a, false),
-        AccountMeta::new_readonly(token_program_b, false),
-        AccountMeta::new_readonly(memo_program, false),
-    ];
-    Instruction {
-        program_id,
-        accounts,
-        data,
-    }
-}
-
-/// `recover_dvp` — args: settlement_authority, user_a, user_b, mint_a, mint_b, nonce
-fn build_recover_dvp_ix(
-    program_id: Pubkey,
-    signer: Pubkey,
-    swap_dvp: Pubkey,
-    nonce_tombstone: Pubkey,
-    mint: Pubkey,
-    dvp_escrow_ata: Pubkey,
-    signer_dest_ata: Pubkey,
-    token_program: Pubkey,
-    memo_program: Pubkey,
-    settlement_authority: [u8; 32],
-    user_a: [u8; 32],
-    user_b: [u8; 32],
-    mint_a: [u8; 32],
-    mint_b: [u8; 32],
-    nonce: u64,
-) -> Instruction {
-    let mut data: Vec<u8> = vec![5];
-    data.extend_from_slice(settlement_authority.as_ref());
-    data.extend_from_slice(user_a.as_ref());
-    data.extend_from_slice(user_b.as_ref());
-    data.extend_from_slice(mint_a.as_ref());
-    data.extend_from_slice(mint_b.as_ref());
-    data.extend_from_slice(&nonce.to_le_bytes());
-    let accounts = vec![
-        AccountMeta::new(signer, true),
-        AccountMeta::new_readonly(swap_dvp, false),
-        AccountMeta::new_readonly(nonce_tombstone, false),
-        AccountMeta::new_readonly(mint, false),
-        AccountMeta::new(dvp_escrow_ata, false),
-        AccountMeta::new(signer_dest_ata, false),
-        AccountMeta::new_readonly(token_program, false),
-        AccountMeta::new_readonly(memo_program, false),
-    ];
-    Instruction {
-        program_id,
-        accounts,
-        data,
-    }
-}
-
-#[derive(Clone)]
-struct DvpRecord {
-    swap_dvp: Pubkey,
-    tombstone: Pubkey,
-    authority: Pubkey,
-    user_a: Pubkey,
-    user_b: Pubkey,
-    mint_a: Pubkey,
-    mint_b: Pubkey,
-    dvp_ata_a: Pubkey,
-    dvp_ata_b: Pubkey,
-    nonce: u64,
-    amount_a: u64,
-    amount_b: u64,
-    token_program_a: Pubkey,
-    token_program_b: Pubkey,
-}
-#[derive(Clone, Default)]
-struct Action {
-    name: &'static str,
-    args: Vec<(&'static str, u128)>,
-    // WHICH accounts this action used, by the name the IDL gives them.
-    accounts: Vec<(&'static str, Pubkey)>,
-    ok: bool,
-    fee: u64,
-}
-
-impl Action {
-    fn new(name: &'static str, args: Vec<(&'static str, u128)>) -> Self {
-        Self {
-            name,
-            args,
-            accounts: Vec::new(),
-            ok: false,
-            fee: 0,
-        }
-    }
-    /// The account this action passed under that name, if it passed one.
-    fn account(&self, name: &str) -> Option<Pubkey> {
-        self.accounts
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, k)| *k)
-    }
-    /// True when this action is `name` and it succeeded.
-    fn was(&self, name: &str) -> bool {
-        self.name == name && self.ok
-    }
-    /// An argument it was called with, or 0 if this action has no such argument.
-    fn arg(&self, name: &str) -> u128 {
-        self.args
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, v)| *v)
-            .unwrap_or(0)
-    }
-}
+const WATCHED_MAX: usize = 48; // accounts snapshot() carries...
 
 #[derive(Clone)]
 struct DvpSwapProgramFixture {
@@ -399,7 +60,6 @@ struct DvpSwapProgramFixture {
     closed: Vec<DvpRecord>,
 }
 #[fuzz_fixture]
-
 impl DvpSwapProgramFixture {
     pub fn setup() -> Self {
         let mut ctx = TestContext::new();
@@ -424,7 +84,7 @@ impl DvpSwapProgramFixture {
             actors.push(keypair);
         }
 
-        // ── SPL Token mints (indices 0, 1 in self.mints) ─────────────────────
+        // ── SPL Token mints (indices 0, 1) ────────────────────────────────────
         let mint_authority = actors[0].pubkey();
         let mut mints: Vec<Pubkey> = Vec::new();
         for i in 0..2u8 {
@@ -437,12 +97,10 @@ impl DvpSwapProgramFixture {
                 .unwrap();
             mints.push(mint);
         }
-        let mint_a = mints[0]; // [100u8; 32]
-        let mint_b = mints[1]; // [101u8; 32]
+        let mint_a = mints[0];
+        let mint_b = mints[1];
 
-        // ── Token-2022 clean mints (indices 2, 3 in self.mints) ──────────────
-        // FIX: push mint_a_22 / mint_b_22 into `mints` so action_MODEL_create_dvp_real
-        // and action_MODEL_create_mint_pair can find them at indices 2 and 3.
+        // ── Token-2022 mints (indices 2, 3) ───────────────────────────────────
         let mint_a_22 = litesvm_token::CreateMint::new(&mut ctx.svm, &*actors[0])
             .authority(&actors[0].pubkey())
             .decimals(0)
@@ -458,1061 +116,227 @@ impl DvpSwapProgramFixture {
         mints.push(mint_a_22); // index 2
         mints.push(mint_b_22); // index 3
 
-        let create_blocked_mint =
-            |ctx: &mut TestContext, mint_pubkey: Pubkey, ext: ExtensionType| {
-                let size = ExtensionType::try_calculate_account_len::<T22Mint>(&[ext]).unwrap();
-                let mut data = vec![0u8; size];
-                {
-                    let mut state =
-                        StateWithExtensionsMut::<T22Mint>::unpack_uninitialized(&mut data).unwrap();
-                    match ext {
-                        ExtensionType::TransferFeeConfig => {
-                            state.init_extension::<TransferFeeConfig>(true).unwrap();
-                        }
-                        ExtensionType::InterestBearingConfig => {
-                            state.init_extension::<InterestBearingConfig>(true).unwrap();
-                        }
-                        ExtensionType::NonTransferable => {
-                            state.init_extension::<NonTransferable>(true).unwrap();
-                        }
-                        _ => {}
+        let create_blocked_mint = |ctx: &mut TestContext,
+                                   mint_pubkey: Pubkey,
+                                   ext: ExtensionType|
+         -> Pubkey {
+            let size = ExtensionType::try_calculate_account_len::<T22Mint>(&[ext]).unwrap();
+            let mut data = vec![0u8; size];
+            {
+                let mut state =
+                    StateWithExtensionsMut::<T22Mint>::unpack_uninitialized(&mut data).unwrap();
+                match ext {
+                    ExtensionType::TransferFeeConfig => {
+                        state.init_extension::<TransferFeeConfig>(true).unwrap();
                     }
-                    state.base.decimals = 0;
-                    state.base.is_initialized = true;
-                    state.pack_base();
-                    state.init_account_type().unwrap();
-                    data[0..4].copy_from_slice(&1u32.to_le_bytes());
-                    data[4..36].copy_from_slice(&mint_authority.to_bytes());
+                    ExtensionType::InterestBearingConfig => {
+                        state.init_extension::<InterestBearingConfig>(true).unwrap();
+                    }
+                    ExtensionType::NonTransferable => {
+                        state.init_extension::<NonTransferable>(true).unwrap();
+                    }
+                    ExtensionType::ScaledUiAmount => {
+                        state.init_extension::<spl_token_2022_interface::extension::scaled_ui_amount::ScaledUiAmountConfig>(true).unwrap();
+                    }
+                    _ => {}
                 }
-                let account = solana_account::Account {
-                    lamports: 2_039_280,
-                    data,
-                    owner: Self::TOKEN_PROGRAM_2022,
-                    executable: false,
-                    rent_epoch: u64::MAX,
-                };
-                ctx.svm.set_account(mint_pubkey, account.into()).unwrap();
+                // Set authority on state.base before pack_base — not at raw offsets.
+                // pack_base() writes the base Mint layout; init_account_type() writes
+                // the AccountType discriminator at the correct T22 position.
+                state.base.mint_authority = solana_program_option::COption::Some(mint_authority);
+                state.base.decimals = 0;
+                state.base.is_initialized = true;
+                state.pack_base();
+                state.init_account_type().unwrap();
+                // Nothing after this — the two data[0..4]/data[4..36] writes
+                // from the original were overwriting already-correct packed data
+                // at wrong SPL Token offsets.
+            }
+            let account = solana_account::Account {
+                lamports: 2_039_280,
+                data,
+                owner: Self::TOKEN_PROGRAM_2022,
+                executable: false,
+                rent_epoch: u64::MAX,
             };
+            ctx.svm.set_account(mint_pubkey, account.into()).unwrap();
+            mint_pubkey
+        };
 
-        create_blocked_mint(
+        mints.push(create_blocked_mint(
             &mut ctx,
             Pubkey::new_from_array([110u8; 32]),
             ExtensionType::TransferFeeConfig,
-        );
-        create_blocked_mint(
+        )); // index 4
+        mints.push(create_blocked_mint(
             &mut ctx,
             Pubkey::new_from_array([111u8; 32]),
             ExtensionType::InterestBearingConfig,
-        );
-        create_blocked_mint(
+        )); // index 5
+        mints.push(create_blocked_mint(
             &mut ctx,
             Pubkey::new_from_array([112u8; 32]),
             ExtensionType::NonTransferable,
-        );
-
-        let derive_swap_dvp_with_mints = |program_id: &Pubkey,
-                                          authority: &Pubkey,
-                                          user_a: &Pubkey,
-                                          user_b: &Pubkey,
-                                          ma: &Pubkey,
-                                          mb: &Pubkey,
-                                          nonce: u64| {
-            let nonce_bytes = nonce.to_le_bytes();
-            Pubkey::find_program_address(
-                &[
-                    b"dvp",
-                    authority.as_ref(),
-                    user_a.as_ref(),
-                    user_b.as_ref(),
-                    ma.as_ref(),
-                    mb.as_ref(),
-                    &nonce_bytes,
-                ],
-                program_id,
-            )
-            .0
-        };
-
-        // Convenience wrapper for SPL-Token-only DVPs (mints fixed to mint_a/mint_b).
-        let derive_swap_dvp = |authority: &Pubkey, user_a: &Pubkey, user_b: &Pubkey, nonce: u64| {
-            derive_swap_dvp_with_mints(
-                &program_id,
-                authority,
-                user_a,
-                user_b,
-                &mint_a,
-                &mint_b,
-                nonce,
-            )
-        };
-
-        let derive_tombstone = |swap_dvp: &Pubkey| {
-            Pubkey::find_program_address(&[b"nonce", swap_dvp.as_ref()], &program_id).0
-        };
-
-        let derive_ata = |wallet: &Pubkey, mint: &Pubkey| {
-            Pubkey::find_program_address(
-                &[wallet.as_ref(), Self::TOKEN_PROGRAM.as_ref(), mint.as_ref()],
-                &Self::ATA_PROGRAM,
-            )
-            .0
-        };
-
-        let derive_ata_with_program = |wallet: &Pubkey, mint: &Pubkey, token_prog: &Pubkey| {
-            Pubkey::find_program_address(
-                &[wallet.as_ref(), token_prog.as_ref(), mint.as_ref()],
-                &Self::ATA_PROGRAM,
-            )
-            .0
-        };
-
-        let create_dvp = |ctx: &mut TestContext,
-                          payer: &Arc<Keypair>,
-                          swap_dvp: Pubkey,
-                          tombstone: Pubkey,
-                          authority: Pubkey,
-                          user_a: Pubkey,
-                          user_b: Pubkey,
-                          ma: Pubkey,
-                          mb: Pubkey,
-                          dvp_ata_a: Pubkey,
-                          dvp_ata_b: Pubkey,
-                          amount_a: u64,
-                          amount_b: u64,
-                          nonce: u64,
-                          token_program_a: Pubkey,
-                          token_program_b: Pubkey,
-                          earliest: Option<i64>| {
-            // Max duration = 365 days. The SVM clock at slot 0 is unix_timestamp ≈ 0,
-            // so expiry = 0 + 31_536_000 is always in the future and within the cap.
-            let expiry = 365i64 * 24 * 60 * 60;
-            let ix = build_create_dvp_ix(
-                program_id,
-                payer.pubkey(),
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                ma,
-                mb,
-                dvp_ata_a,
-                dvp_ata_b,
-                token_program_a,
-                token_program_b,
-                Self::ATA_PROGRAM,
-                amount_a,
-                amount_b,
-                expiry,
-                nonce,
-                None,
-                None,
-                None,
-                earliest,
-            );
-            ctx.raw_call(ix).signers(&[&**payer]).send()
-        };
-
-        let mut closed: Vec<DvpRecord> = Vec::new();
+        )); // index 6
+        mints.push(create_blocked_mint(
+            &mut ctx,
+            Pubkey::new_from_array([113u8; 32]),
+            ExtensionType::ScaledUiAmount,
+        )); // index 7
+            // ── DVPs ──────────────────────────────────────────────────────────────
         let mut dvps: Vec<DvpRecord> = Vec::new();
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 0u64;
-            let amount_a = 1_000u64;
-            let amount_b = 2_000u64;
-
-            let swap_dvp = derive_swap_dvp(&authority, &user_a, &user_b, nonce);
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
-            let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
-
-            let r = create_dvp(
-                &mut ctx,
-                &actors[0],
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                amount_a,
-                amount_b,
-                nonce,
-                Self::TOKEN_PROGRAM,
-                Self::TOKEN_PROGRAM,
-                None,
-            );
-            assert!(
-                r.map(|o| o.is_success()).unwrap_or(false),
-                "[SETUP] DVP 1 create failed"
-            );
-
-            // All four party ATAs — settle needs ua_b and ub_a as destination ATAs
-            let ua_a = derive_ata(&user_a, &mint_a);
-            let ua_b = derive_ata(&user_a, &mint_b); // user_a receives mint_b at settle
-            let ub_a = derive_ata(&user_b, &mint_a); // user_b receives mint_a at settle
-            let ub_b = derive_ata(&user_b, &mint_b);
-            for (owner, mint, ata) in [
-                (user_a, mint_a, ua_a),
-                (user_a, mint_b, ua_b),
-                (user_b, mint_a, ub_a),
-                (user_b, mint_b, ub_b),
-            ] {
-                ctx.create_token_account()
-                    .pubkey(ata)
-                    .mint(mint)
-                    .token_owner(owner)
-                    .amount(0)
-                    .create()
-                    .unwrap();
-            }
-
-            // MintTo source ATAs then transfer into escrows
-            for (mint, dest, amount) in [(mint_a, ua_a, amount_a), (mint_b, ub_b, amount_b)] {
-                let mut data = vec![7u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(mint, false),
-                            AccountMeta::new(dest, false),
-                            AccountMeta::new_readonly(actors[0].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[0]])
-                    .send();
-            }
-            for (src, dst, signer_idx, amount) in [
-                (ua_a, dvp_ata_a, 1usize, amount_a),
-                (ub_b, dvp_ata_b, 2usize, amount_b),
-            ] {
-                let mut data = vec![3u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(src, false),
-                            AccountMeta::new(dst, false),
-                            AccountMeta::new_readonly(actors[signer_idx].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[signer_idx]])
-                    .send();
-            }
-
-            eprintln!(
-                "[SETUP DVP1] dvp_ata_a: {:?}",
-                ctx.get_account(&dvp_ata_a)
-                    .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap_or([0; 8])))
-            );
-            eprintln!(
-                "[SETUP DVP1] dvp_ata_b: {:?}",
-                ctx.get_account(&dvp_ata_b)
-                    .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap_or([0; 8])))
-            );
-
-            dvps.push(DvpRecord {
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                nonce,
-                amount_a,
-                amount_b,
-                token_program_a: Self::TOKEN_PROGRAM,
-                token_program_b: Self::TOKEN_PROGRAM,
-            });
+        let mut closed: Vec<DvpRecord> = Vec::new();
+        // DVP 1  — SPL, exact-funded, all 4 ATAs: primary settle path
+        // DVP 2  — SPL, exact-funded, all 4 ATAs: second settle seat (fuzzer variety)
+        // DVP 3  — SPL, exact-funded, all 4 ATAs: third settle seat (fuzzer variety)
+        // DVP 4  — SPL, rejected → closed: tombstone + synthetic escrow for recover path
+        // DVP 5  — SPL, short-expiry (1s), unfunded: reclaim-after-expiry path
+        // DVP 6  — SPL, surplus-funded (+1 per leg): settle surplus-refund branch
+        // DVP 7  — SPL, earliest constraint, funded: settle blocked until clock warp
+        // DVP 8  — T22, exact-funded, all 4 ATAs: T22 settle path
+        // DVP 9  — T22, unfunded: T22 DVP awaiting fund_legs action
+        // DVP 10 — SPL, exact-funded, all 4 ATAs: reserved for cancel (settlement_authority signer)
+        // DVP 11 — SPL, leg A funded, leg B empty: partial-fund reclaim + skip-transfer branch
+        // DVP 12 — Mixed (SPL leg A, T22 leg B): only DVP with token_program_a != token_program_b
+        if let Some(r) = setup_dvp_funded(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a,
+            mint_b,
+            0,
+            1_000,
+            2_000,
+            0,
+            Self::TOKEN_PROGRAM,
+            "DVP1",
+        ) {
+            dvps.push(r);
         }
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 1u64;
-            let amount_a = 500u64;
-            let amount_b = 1_000u64;
-
-            let swap_dvp = derive_swap_dvp(&authority, &user_a, &user_b, nonce);
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
-            let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
-
-            let r = create_dvp(
-                &mut ctx,
-                &actors[0],
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                amount_a,
-                amount_b,
-                nonce,
-                Self::TOKEN_PROGRAM,
-                Self::TOKEN_PROGRAM,
-                None,
-            );
-            assert!(
-                r.map(|o| o.is_success()).unwrap_or(false),
-                "[SETUP] DVP 2 create failed"
-            );
-
-            let ua_a = derive_ata(&user_a, &mint_a);
-            let ub_b = derive_ata(&user_b, &mint_b);
-            for (owner, mint, ata) in [(user_a, mint_a, ua_a), (user_b, mint_b, ub_b)] {
-                ctx.create_token_account()
-                    .pubkey(ata)
-                    .mint(mint)
-                    .token_owner(owner)
-                    .amount(0)
-                    .create()
-                    .unwrap();
-            }
-            for (mint, dest, amount) in [(mint_a, ua_a, amount_a), (mint_b, ub_b, amount_b)] {
-                let mut data = vec![7u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(mint, false),
-                            AccountMeta::new(dest, false),
-                            AccountMeta::new_readonly(actors[0].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[0]])
-                    .send();
-            }
-            for (src, dst, signer_idx, amount) in [
-                (ua_a, dvp_ata_a, 1usize, amount_a),
-                (ub_b, dvp_ata_b, 2usize, amount_b),
-            ] {
-                let mut data = vec![3u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(src, false),
-                            AccountMeta::new(dst, false),
-                            AccountMeta::new_readonly(actors[signer_idx].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[signer_idx]])
-                    .send();
-            }
-
-            dvps.push(DvpRecord {
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                nonce,
-                amount_a,
-                amount_b,
-                token_program_a: Self::TOKEN_PROGRAM,
-                token_program_b: Self::TOKEN_PROGRAM,
-            });
+        if let Some(r) = setup_dvp_funded(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a,
+            mint_b,
+            1,
+            500,
+            1_000,
+            0,
+            Self::TOKEN_PROGRAM,
+            "DVP2",
+        ) {
+            dvps.push(r);
         }
-
-        // ══════════════════════════════════════════════════════════════════════
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 2u64;
-            let amount_a = 750u64;
-            let amount_b = 1_500u64;
-
-            let swap_dvp = derive_swap_dvp(&authority, &user_a, &user_b, nonce);
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
-            let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
-
-            let r = create_dvp(
-                &mut ctx,
-                &actors[0],
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                amount_a,
-                amount_b,
-                nonce,
-                Self::TOKEN_PROGRAM,
-                Self::TOKEN_PROGRAM,
-                None,
-            );
-            assert!(
-                r.map(|o| o.is_success()).unwrap_or(false),
-                "[SETUP] DVP 3 create failed"
-            );
-
-            let ua_a = derive_ata(&user_a, &mint_a);
-            let ub_b = derive_ata(&user_b, &mint_b);
-            for (owner, mint, ata) in [(user_a, mint_a, ua_a), (user_b, mint_b, ub_b)] {
-                ctx.create_token_account()
-                    .pubkey(ata)
-                    .mint(mint)
-                    .token_owner(owner)
-                    .amount(0)
-                    .create()
-                    .unwrap();
-            }
-            for (mint, dest, amount) in [(mint_a, ua_a, amount_a), (mint_b, ub_b, amount_b)] {
-                let mut data = vec![7u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(mint, false),
-                            AccountMeta::new(dest, false),
-                            AccountMeta::new_readonly(actors[0].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[0]])
-                    .send();
-            }
-            for (src, dst, signer_idx, amount) in [
-                (ua_a, dvp_ata_a, 1usize, amount_a),
-                (ub_b, dvp_ata_b, 2usize, amount_b),
-            ] {
-                let mut data = vec![3u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(src, false),
-                            AccountMeta::new(dst, false),
-                            AccountMeta::new_readonly(actors[signer_idx].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[signer_idx]])
-                    .send();
-            }
-
-            dvps.push(DvpRecord {
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                nonce,
-                amount_a,
-                amount_b,
-                token_program_a: Self::TOKEN_PROGRAM,
-                token_program_b: Self::TOKEN_PROGRAM,
-            });
+        if let Some(r) = setup_dvp_funded(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a,
+            mint_b,
+            2,
+            750,
+            1_500,
+            0,
+            Self::TOKEN_PROGRAM,
+            "DVP3",
+        ) {
+            dvps.push(r);
         }
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 3u64;
-            let amount_a = 100u64;
-            let amount_b = 200u64;
-
-            let swap_dvp = derive_swap_dvp(&authority, &user_a, &user_b, nonce);
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
-            let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
-
-            let r = create_dvp(
-                &mut ctx,
-                &actors[0],
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                amount_a,
-                amount_b,
-                nonce,
-                Self::TOKEN_PROGRAM,
-                Self::TOKEN_PROGRAM,
-                None,
-            );
-            assert!(
-                r.map(|o| o.is_success()).unwrap_or(false),
-                "[SETUP] DVP 4 create failed"
-            );
-
-            let ua_a = derive_ata(&user_a, &mint_a);
-            let ub_b = derive_ata(&user_b, &mint_b);
-            for (owner, mint, ata) in [(user_a, mint_a, ua_a), (user_b, mint_b, ub_b)] {
-                ctx.create_token_account()
-                    .pubkey(ata)
-                    .mint(mint)
-                    .token_owner(owner)
-                    .amount(0)
-                    .create()
-                    .unwrap();
-            }
-
-            let reject_ix = Instruction {
-                program_id,
-                accounts: vec![
-                    AccountMeta::new(user_a, true),    // signer, writable (receives rent)
-                    AccountMeta::new(swap_dvp, false), // writable — will be closed
-                    AccountMeta::new_readonly(mint_a, false),
-                    AccountMeta::new_readonly(mint_b, false),
-                    AccountMeta::new(dvp_ata_a, false), // writable — will be closed
-                    AccountMeta::new(dvp_ata_b, false), // writable — will be closed
-                    AccountMeta::new(ua_a, false),
-                    AccountMeta::new(ub_b, false),
-                    AccountMeta::new_readonly(Self::TOKEN_PROGRAM, false),
-                    AccountMeta::new_readonly(Self::TOKEN_PROGRAM, false),
-                    AccountMeta::new_readonly(Self::MEMO_PROGRAM, false),
-                ],
-                data: vec![4u8, 0u8], // discriminator=4, leg_a_extras_count=0
-            };
-            let r = ctx.raw_call(reject_ix).signers(&[&*actors[1]]).send();
-            eprintln!(
-                "[SETUP DVP4] reject: {:?}",
-                r.as_ref().map(|o| o.is_success())
-            );
-
-            for (mint, escrow) in [(mint_a, dvp_ata_a), (mint_b, dvp_ata_b)] {
-                ctx.create_token_account()
-                    .pubkey(escrow)
-                    .mint(mint)
-                    .token_owner(swap_dvp)
-                    .amount(50)
-                    .create()
-                    .unwrap();
-            }
-
-            closed.push(DvpRecord {
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                nonce,
-                amount_a,
-                amount_b,
-                token_program_a: Self::TOKEN_PROGRAM,
-                token_program_b: Self::TOKEN_PROGRAM,
-            });
+        if let Some(r) = setup_dvp_closed(
+            &mut ctx, program_id, &actors, mint_a, mint_b, 3, 100, 200, 50, "DVP4",
+        ) {
+            closed.push(r);
         }
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 4u64;
-            let amount_a = 300u64;
-            let amount_b = 600u64;
-
-            let swap_dvp = derive_swap_dvp(&authority, &user_a, &user_b, nonce);
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
-            let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
-
-            // expiry = 1 second from epoch 0: any warp of a few slots will exceed it.
-            let short_expiry = 1i64;
-            let ix = build_create_dvp_ix(
-                program_id,
-                actors[0].pubkey(),
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                Self::TOKEN_PROGRAM,
-                Self::TOKEN_PROGRAM,
-                Self::ATA_PROGRAM,
-                amount_a,
-                amount_b,
-                short_expiry,
-                nonce,
-                None,
-                None,
-                None,
-                None,
-            );
-            let r = ctx.raw_call(ix).signers(&[&*actors[0]]).send();
-
-            eprintln!(
-                "[SETUP DVP5] create short-expiry: {:?}",
-                r.as_ref().map(|o| o.is_success())
-            );
-
-            dvps.push(DvpRecord {
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                nonce,
-                amount_a,
-                amount_b,
-                token_program_a: Self::TOKEN_PROGRAM,
-                token_program_b: Self::TOKEN_PROGRAM,
-            });
+        if let Some(r) = setup_dvp_short_expiry(
+            &mut ctx, program_id, &actors, mint_a, mint_b, 4, 300, 600, "DVP5",
+        ) {
+            dvps.push(r);
         }
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 5u64;
-            let amount_a = 1_000u64;
-            let amount_b = 2_000u64;
-
-            let swap_dvp = derive_swap_dvp(&authority, &user_a, &user_b, nonce);
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
-            let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
-
-            let r = create_dvp(
-                &mut ctx,
-                &actors[0],
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                amount_a,
-                amount_b,
-                nonce,
-                Self::TOKEN_PROGRAM,
-                Self::TOKEN_PROGRAM,
-                None,
-            );
-            assert!(
-                r.map(|o| o.is_success()).unwrap_or(false),
-                "[SETUP] DVP 6 create failed"
-            );
-
-            // All four party ATAs , settle needs ua_b and ub_a as destination ATAs,
-            // ua_a and ub_b as surplus refund destinations.
-            let ua_a = derive_ata(&user_a, &mint_a);
-            let ua_b = derive_ata(&user_a, &mint_b);
-            let ub_a = derive_ata(&user_b, &mint_a);
-            let ub_b = derive_ata(&user_b, &mint_b);
-            for (owner, mint, ata) in [
-                (user_a, mint_a, ua_a),
-                (user_a, mint_b, ua_b),
-                (user_b, mint_a, ub_a),
-                (user_b, mint_b, ub_b),
-            ] {
-                ctx.create_token_account()
-                    .pubkey(ata)
-                    .mint(mint)
-                    .token_owner(owner)
-                    .amount(0)
-                    .create()
-                    .unwrap();
-            }
-
-            // Mint amount + 1 to create a surplus of 1 token per leg
-            for (mint, dest, amount) in [(mint_a, ua_a, amount_a + 1), (mint_b, ub_b, amount_b + 1)]
-            {
-                let mut data = vec![7u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(mint, false),
-                            AccountMeta::new(dest, false),
-                            AccountMeta::new_readonly(actors[0].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[0]])
-                    .send();
-            }
-            // Transfer amount + 1 into escrows
-            for (src, dst, signer_idx, amount) in [
-                (ua_a, dvp_ata_a, 1usize, amount_a + 1),
-                (ub_b, dvp_ata_b, 2usize, amount_b + 1),
-            ] {
-                let mut data = vec![3u8];
-                data.extend_from_slice(&amount.to_le_bytes());
-                let _ = ctx
-                    .raw_call(Instruction {
-                        program_id: Self::TOKEN_PROGRAM,
-                        accounts: vec![
-                            AccountMeta::new(src, false),
-                            AccountMeta::new(dst, false),
-                            AccountMeta::new_readonly(actors[signer_idx].pubkey(), true),
-                        ],
-                        data,
-                    })
-                    .signers(&[&*actors[signer_idx]])
-                    .send();
-            }
-
-            dvps.push(DvpRecord {
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                nonce,
-                amount_a,
-                amount_b,
-                token_program_a: Self::TOKEN_PROGRAM,
-                token_program_b: Self::TOKEN_PROGRAM,
-            });
+        if let Some(r) = setup_dvp_funded(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a,
+            mint_b,
+            5,
+            1_000,
+            2_000,
+            1,
+            Self::TOKEN_PROGRAM,
+            "DVP6",
+        ) {
+            dvps.push(r);
         }
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 6u64;
-            let amount_a = 500u64;
-            let amount_b = 1_000u64;
-
-            let swap_dvp = derive_swap_dvp(&authority, &user_a, &user_b, nonce);
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a = derive_ata(&swap_dvp, &mint_a);
-            let dvp_ata_b = derive_ata(&swap_dvp, &mint_b);
-
-            let earliest = Some(365i64 * 24 * 60 * 60);
-
-            let r = create_dvp(
-                &mut ctx,
-                &actors[0],
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                amount_a,
-                amount_b,
-                nonce,
-                Self::TOKEN_PROGRAM,
-                Self::TOKEN_PROGRAM,
-                earliest,
-            );
-            eprintln!(
-                "[SETUP DVP7] create: {:?}",
-                r.as_ref().map(|o| o.is_success())
-            );
-
-            dvps.push(DvpRecord {
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a,
-                mint_b,
-                dvp_ata_a,
-                dvp_ata_b,
-                nonce,
-                amount_a,
-                amount_b,
-                token_program_a: Self::TOKEN_PROGRAM,
-                token_program_b: Self::TOKEN_PROGRAM,
-            });
+        if let Some(r) = setup_dvp_earliest(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a,
+            mint_b,
+            6,
+            500,
+            1_000,
+            365i64 * 24 * 60 * 60,
+            Self::TOKEN_PROGRAM,
+            "DVP7",
+        ) {
+            dvps.push(r);
         }
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 7u64;
-            let amount_a = 1_000u64;
-            let amount_b = 2_000u64;
-
-            let swap_dvp = derive_swap_dvp_with_mints(
-                &program_id,
-                &authority,
-                &user_a,
-                &user_b,
-                &mint_a_22,
-                &mint_b_22,
-                nonce,
-            );
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a =
-                derive_ata_with_program(&swap_dvp, &mint_a_22, &Self::TOKEN_PROGRAM_2022);
-            let dvp_ata_b =
-                derive_ata_with_program(&swap_dvp, &mint_b_22, &Self::TOKEN_PROGRAM_2022);
-
-            let ix = build_create_dvp_ix(
-                program_id,
-                actors[0].pubkey(),
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a_22,
-                mint_b_22,
-                dvp_ata_a,
-                dvp_ata_b,
-                Self::TOKEN_PROGRAM_2022,
-                Self::TOKEN_PROGRAM_2022,
-                Self::ATA_PROGRAM,
-                amount_a,
-                amount_b,
-                365i64 * 24 * 60 * 60, // expiry
-                nonce,
-                None,
-                None,
-                None,
-                None,
-            );
-            let create_ok = ctx
-                .raw_call(ix)
-                .signers(&[&*actors[0]])
-                .send()
-                .map(|o| o.is_success())
-                .unwrap_or(false);
-            eprintln!("[SETUP DVP8] create_dvp_t22: {}", create_ok);
-
-            // All four party ATAs (T22)
-            let ua_a = derive_ata_with_program(&user_a, &mint_a_22, &Self::TOKEN_PROGRAM_2022);
-            let ua_b = derive_ata_with_program(&user_a, &mint_b_22, &Self::TOKEN_PROGRAM_2022);
-            let ub_a = derive_ata_with_program(&user_b, &mint_a_22, &Self::TOKEN_PROGRAM_2022);
-            let ub_b = derive_ata_with_program(&user_b, &mint_b_22, &Self::TOKEN_PROGRAM_2022);
-
-            for (wallet, mint) in [
-                (user_a, mint_a_22),
-                (user_a, mint_b_22),
-                (user_b, mint_a_22),
-                (user_b, mint_b_22),
-            ] {
-                let r = litesvm_token::CreateAssociatedTokenAccountIdempotent::new(
-                    &mut ctx.svm,
-                    &*actors[0],
-                    &mint,
-                )
-                .owner(&wallet)
-                .token_program_id(&Self::TOKEN_PROGRAM_2022)
-                .send();
-                eprintln!("[SETUP DVP8] create_ata {:?}: {:?}", wallet, r.is_ok());
-            }
-
-            // MintTo source ATAs
-            for (mint, dest, amount) in [(mint_a_22, ua_a, amount_a), (mint_b_22, ub_b, amount_b)] {
-                let r = litesvm_token::MintTo::new(&mut ctx.svm, &*actors[0], &mint, &dest, amount)
-                    .owner(&actors[0])
-                    .token_program_id(&Self::TOKEN_PROGRAM_2022)
-                    .send();
-                eprintln!("[SETUP DVP8] mint_to {:?}: {:?}", dest, r.is_ok());
-            }
-
-            for (src, dst, signer_idx, mint, amount) in [
-                (ua_a, dvp_ata_a, 1usize, mint_a_22, amount_a),
-                (ub_b, dvp_ata_b, 2usize, mint_b_22, amount_b),
-            ] {
-                let r = litesvm_token::TransferChecked::new(
-                    &mut ctx.svm,
-                    &*actors[signer_idx],
-                    &mint,
-                    &dst,
-                    amount,
-                )
-                .source(&src)
-                .decimals(0)
-                .owner(&actors[signer_idx])
-                .token_program_id(&Self::TOKEN_PROGRAM_2022)
-                .send();
-                eprintln!(
-                    "[SETUP DVP8] transfer {:?}->{:?}: {:?}",
-                    src,
-                    dst,
-                    r.is_ok()
-                );
-            }
-
-            eprintln!(
-                "[SETUP DVP8] dvp_ata_a final: {:?}",
-                ctx.svm
-                    .get_account(&dvp_ata_a)
-                    .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap_or([0; 8])))
-            );
-            eprintln!(
-                "[SETUP DVP8] dvp_ata_b final: {:?}",
-                ctx.svm
-                    .get_account(&dvp_ata_b)
-                    .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap_or([0; 8])))
-            );
-
-            if create_ok {
-                dvps.push(DvpRecord {
-                    swap_dvp,
-                    tombstone,
-                    authority,
-                    user_a,
-                    user_b,
-                    mint_a: mint_a_22,
-                    mint_b: mint_b_22,
-                    dvp_ata_a,
-                    dvp_ata_b,
-                    nonce,
-                    amount_a,
-                    amount_b,
-                    token_program_a: Self::TOKEN_PROGRAM_2022,
-                    token_program_b: Self::TOKEN_PROGRAM_2022,
-                });
-            }
+        if let Some(r) = setup_dvp_funded(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a_22,
+            mint_b_22,
+            7,
+            1_000,
+            2_000,
+            0,
+            Self::TOKEN_PROGRAM_2022,
+            "DVP8",
+        ) {
+            dvps.push(r);
         }
-
-        {
-            let authority = actors[0].pubkey();
-            let user_a = actors[1].pubkey();
-            let user_b = actors[2].pubkey();
-            let nonce = 8u64;
-            let amount_a = 500u64;
-            let amount_b = 1_000u64;
-
-            let swap_dvp = derive_swap_dvp_with_mints(
-                &program_id,
-                &authority,
-                &user_a,
-                &user_b,
-                &mint_a_22,
-                &mint_b_22,
-                nonce,
-            );
-            let tombstone = derive_tombstone(&swap_dvp);
-            let dvp_ata_a =
-                derive_ata_with_program(&swap_dvp, &mint_a_22, &Self::TOKEN_PROGRAM_2022);
-            let dvp_ata_b =
-                derive_ata_with_program(&swap_dvp, &mint_b_22, &Self::TOKEN_PROGRAM_2022);
-
-            let ix = build_create_dvp_ix(
-                program_id,
-                actors[0].pubkey(),
-                swap_dvp,
-                tombstone,
-                authority,
-                user_a,
-                user_b,
-                mint_a_22,
-                mint_b_22,
-                dvp_ata_a,
-                dvp_ata_b,
-                Self::TOKEN_PROGRAM_2022,
-                Self::TOKEN_PROGRAM_2022,
-                Self::ATA_PROGRAM,
-                amount_a,
-                amount_b,
-                365i64 * 24 * 60 * 60, // expiry
-                nonce,
-                None,
-                None,
-                None,
-                None,
-            );
-            let create_ok = ctx
-                .raw_call(ix)
-                .signers(&[&*actors[0]])
-                .send()
-                .map(|o| o.is_success())
-                .unwrap_or(false);
-            eprintln!("[SETUP DVP9] create_dvp_t22: {}", create_ok);
-
-            let ua_a = derive_ata_with_program(&user_a, &mint_a_22, &Self::TOKEN_PROGRAM_2022);
-            let ub_b = derive_ata_with_program(&user_b, &mint_b_22, &Self::TOKEN_PROGRAM_2022);
-            for (wallet, mint) in [(user_a, mint_a_22), (user_b, mint_b_22)] {
-                let r = litesvm_token::CreateAssociatedTokenAccountIdempotent::new(
-                    &mut ctx.svm,
-                    &*actors[0],
-                    &mint,
-                )
-                .owner(&wallet)
-                .token_program_id(&Self::TOKEN_PROGRAM_2022)
-                .send();
-                eprintln!("[SETUP DVP9] create_ata {:?}: {:?}", wallet, r.is_ok());
-            }
-
-            if create_ok {
-                dvps.push(DvpRecord {
-                    swap_dvp,
-                    tombstone,
-                    authority,
-                    user_a,
-                    user_b,
-                    mint_a: mint_a_22,
-                    mint_b: mint_b_22,
-                    dvp_ata_a,
-                    dvp_ata_b,
-                    nonce,
-                    amount_a,
-                    amount_b,
-                    token_program_a: Self::TOKEN_PROGRAM_2022,
-                    token_program_b: Self::TOKEN_PROGRAM_2022,
-                });
-            }
+        if let Some(r) = setup_dvp_unfunded(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a_22,
+            mint_b_22,
+            8,
+            500,
+            1_000,
+            Self::TOKEN_PROGRAM_2022,
+            "DVP9",
+        ) {
+            dvps.push(r);
         }
-
+        if let Some(r) = setup_dvp_funded(
+            &mut ctx,
+            program_id,
+            &actors,
+            mint_a,
+            mint_b,
+            9,
+            400,
+            800,
+            0,
+            Self::TOKEN_PROGRAM,
+            "DVP10",
+        ) {
+            dvps.push(r);
+        }
+        if let Some(r) = setup_dvp_partial_funded(
+            &mut ctx, program_id, &actors, mint_a, mint_b, 10, 600, 1_200, "DVP11",
+        ) {
+            dvps.push(r);
+        }
+        if let Some(r) = setup_dvp_mixed(
+            &mut ctx, program_id, &actors, mint_a, mint_b_22, 11, 300, 600, "DVP12",
+        ) {
+            dvps.push(r);
+        }
         Self {
             ctx,
             program_id,
@@ -1533,13 +357,6 @@ impl DvpSwapProgramFixture {
         keys.extend(self.watched.iter().copied());
         keys
     }
-
-    /// State before the current action, so a property can say `old(x)`.
-    ///
-    /// Every action calls this first. Without it any property comparing before
-    /// and after is unexpressible, and those are most of what a fuzzer is for:
-    /// `staking again must not increase what you can claim` cannot be written
-    /// from the after-state alone.
     fn snapshot(&mut self) {
         self.prev_lamports.clear();
         self.prev_data.clear();
@@ -1552,47 +369,12 @@ impl DvpSwapProgramFixture {
         }
     }
 
-    /// Lamports this account held before the current action, or 0 if it had none.
-    fn old_lamports(&self, key: &Pubkey) -> u64 {
-        self.prev_lamports.get(key).copied().unwrap_or(0)
-    }
-
-    /// Raw account data as it was before the current action.
-    ///
-    /// Not every program prefixes its accounts with an 8-byte discriminator —
-    /// a native or Pinocchio program lays its state out itself — so a property
-    /// about such a program reads the bytes and decodes them its own way.
-    fn old_data(&self, key: &Pubkey) -> Option<&[u8]> {
-        self.prev_data.get(key).map(|d| d.as_slice())
-    }
-
-    /// The token balance in an SPL token account, now.
-    ///
-    /// A fixed offset, because the layout is fixed and has been since the
-    /// token program shipped: mint 0..32, owner 32..64, amount 64..72
-    /// little-endian. Reading it that way needs no crate and no type
-    /// declaration - and the alternative is asking a property writer to add
-    /// spl-token to a manifest it cannot see.
-    ///
-    /// Almost every property about a program that moves tokens is a statement
-    /// about this number. On dvp that was most of the file - the escrow balance
-    /// before a settle against the leg amounts, twice per settle - and neither
-    /// side of it could be written.
     fn token_amount(&self, key: &Pubkey) -> Option<u64> {
         let account = self.ctx.get_account(key).ok()?;
         if account.data.len() < 72 {
             return None;
         }
         Some(u64::from_le_bytes(account.data[64..72].try_into().ok()?))
-    }
-
-    /// The same balance as it stood before the current action.
-    fn old_token_amount(&self, key: &Pubkey) -> Option<u64> {
-        let data = self.prev_data.get(key)?;
-        if data.len() < 72 {
-            return None;
-        }
-        Some(u64::from_le_bytes(data[64..72].try_into().ok()?))
     }
 
     /// The mint a token account holds, for a property that has to tell the two
@@ -1606,94 +388,24 @@ impl DvpSwapProgramFixture {
         raw.copy_from_slice(&account.data[..32]);
         Some(Pubkey::new_from_array(raw))
     }
-
-    /// An anchor account as it was before the current action.
-    ///
-    /// None when the account did not exist yet, which is a real answer: a
-    /// property about a change cannot apply to something that was not there.
-    fn old_anchor<T: crucible_fuzzer::anchor_lang::AnchorDeserialize>(
-        &self,
-        key: &Pubkey,
-    ) -> Option<T> {
-        let data = self.prev_data.get(key)?;
-        if data.len() < 8 {
-            return None;
-        }
-        T::deserialize(&mut &data[8..]).ok()
-    }
-
-    /// The nth actor, or None while the fuzzer has not created any.
-    ///
-    /// Wrapping rather than failing on an out-of-range draw: the fuzzer picks
-    /// `which` blind, and a draw that misses would otherwise reject a
-    /// transaction for arithmetic rather than for anything the program did.
     fn actor(&self, which: u64) -> Option<Arc<Keypair>> {
         if self.actors.is_empty() {
             return None;
         }
         Some(self.actors[(which as usize) % self.actors.len()].clone())
     }
-
-    /// The nth actor's address, for an argument that takes one.
-    ///
-    /// A pubkey argument drawn at random names an account that does not
-    /// exist, so every transaction fails for the same uninteresting reason.
-    /// Choosing among the accounts the fixture built fuzzes the question
-    /// that matters: what happens when this one is passed instead of that one.
     fn actor_key(&self, which: u64) -> [u8; 32] {
         self.actor(which)
             .map(|a| a.pubkey().to_bytes())
             .unwrap_or([0u8; 32])
     }
-
-    /// Remember an account, so the next snapshot() records it.
-    ///
-    /// Called by every action for every account it hands the program, which is
-    /// what makes `old(x)` work for accounts NOBODY DECLARED. The fixture's own
-    /// fields cover the actors and the PDAs derived from them; a token account,
-    /// a mint, an escrow created by an action mid-campaign is in none of them,
-    /// and a property that needs its balance before the action cannot be written.
-    ///
-    /// On dvp that was not a corner case: eighteen of thirty-two properties were
-    /// dropped for exactly this reason - `old(dvp_ata_a.amount)`, the escrow
-    /// balance before a settle - and of the fourteen that survived, not one
-    /// caught a single one of two hundred and fifty broken copies of the program.
-    ///
-    /// Bounded, because snapshot() copies the data of every account in the list
-    /// before every action, and an unbounded list is a campaign that slows to a
-    /// stop.
     fn watch(&mut self, key: Pubkey) {
         if self.watched.len() < WATCHED_MAX && !self.watched.contains(&key) {
             self.watched.push(key);
         }
     }
-
-    /// The unix timestamp the program will read from `Clock::get()`.
-    ///
-    /// The fixture has no clock accessor, so read the Clock sysvar account
-    /// directly: its layout is slot(8) | epoch_start_timestamp(8) | epoch(8)
-    /// | leader_schedule_epoch(8) | unix_timestamp(8), all little-endian, so
-    /// unix_timestamp sits at offset 32. Falling back to a guessed wall clock
-    /// is exactly what produced ExpiryTooFarInFuture, so the fallback here is
-    /// derived from the slot with a zero epoch instead.
     fn unix_now(&self) -> i64 {
-        const CLOCK_SYSVAR: Pubkey = Pubkey::new_from_array([
-            6, 167, 213, 23, 24, 199, 116, 201, 40, 86, 99, 152, 105, 29, 94, 182, 139, 94, 184,
-            163, 155, 75, 109, 92, 115, 85, 91, 33, 0, 0, 0, 0,
-        ]);
-        if let Ok(account) = self.ctx.get_account(&CLOCK_SYSVAR) {
-            if account.data.len() >= 40 {
-                if let Ok(raw) = account.data[32..40].try_into() {
-                    let t = i64::from_le_bytes(raw);
-                    if t > 0 {
-                        return t;
-                    }
-                }
-            }
-        }
-        // No clock account visible: the runtime's timestamp starts at ~0 and
-        // advances with the slot, so mirror that rather than inventing 2023.
-        (self.ctx.slot() as i64) * 2 / 5
+        (self.ctx.slot() as i64)
     }
 
     const TOKEN_PROGRAM: Pubkey = Pubkey::new_from_array([
@@ -1738,14 +450,6 @@ impl DvpSwapProgramFixture {
         )
     }
 
-    /// The canonical associated token account for (wallet, SPL Token, mint).
-    fn derive_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
-        Pubkey::find_program_address(
-            &[wallet.as_ref(), Self::TOKEN_PROGRAM.as_ref(), mint.as_ref()],
-            &Self::ATA_PROGRAM,
-        )
-        .0
-    }
     fn derive_ata_with_program(wallet: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
         Pubkey::find_program_address(
             &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
@@ -1754,8 +458,6 @@ impl DvpSwapProgramFixture {
         .0
     }
 
-    /// Write an SPL token account's `amount` field in place. Only valid on an
-    /// account the token program already owns (an escrow the ATA CPI created).
     fn set_token_amount(&mut self, key: &Pubkey, amount: u64) -> bool {
         let mut account = match self.ctx.read_account(key) {
             Ok(a) => a,
@@ -1787,8 +489,8 @@ impl DvpSwapProgramFixture {
         which_associated_token_program: u64,
         #[range(1..100000000000)] amount_a: u64,
         #[range(1..100000000000)] amount_b: u64,
-        #[range(0..10_000)] expiry_timestamp: i64,
-        nonce: u64,
+        #[range(1..31_536_000)] expiry_delta: i64,
+        #[range(0..16)] nonce: u64,
         ref_string_value_choice: u64,
         ref_string_present: u64,
         user_a_settlement_destination_value_actor: u64,
@@ -1797,6 +499,26 @@ impl DvpSwapProgramFixture {
         user_b_settlement_destination_present: u64,
         earliest_settlement_timestamp: Option<i64>,
     ) -> bool {
+        //intentional toggling of user a /b
+        let user_a = match which_user_a % 6 {
+            0 if !self.mints.is_empty() => self.mints[which_user_a as usize % self.mints.len()],
+            _ => Pubkey::new_from_array(self.actor_key(which_user_a)),
+        };
+        let user_b = match which_user_b % 6 {
+            0 if !self.mints.is_empty() => self.mints[which_user_b as usize % self.mints.len()],
+            _ => Pubkey::new_from_array(self.actor_key(which_user_b)),
+        };
+        let settlement_authority_pubkey = match which_settlement_authority % 8 {
+            0 => Self::TOKEN_PROGRAM, // executable → SettlementAuthorityExecutable
+            1 => Self::ATA_PROGRAM,   // executable
+            _ => match self.actor(which_settlement_authority) {
+                Some(a) => a.pubkey(),
+                None => {
+                    note_blocked("create_dvp", -1, &"no settlement auth");
+                    return false;
+                }
+            },
+        };
         let payer = match self.actor(which_payer) {
             Some(actor) => actor,
             None => {
@@ -1804,28 +526,66 @@ impl DvpSwapProgramFixture {
                 return false;
             }
         };
-        let settlement_authority = match self.actor(which_settlement_authority) {
-            Some(actor) => actor,
-            None => {
-                note_blocked("create_dvp", -1, &"no settlement authority available");
-                return false;
-            }
+
+        // expiry is an absolute timestamp; compute it as now + delta so it is
+        // always in range [now+1, now+365d] regardless of the current slot.
+        let expiry_timestamp = self.unix_now().saturating_add(expiry_delta);
+
+        let token_program_a = if which_token_program_a % 2 == 0 {
+            Self::TOKEN_PROGRAM
+        } else {
+            Self::TOKEN_PROGRAM_2022
         };
-        let swap_dvp = Pubkey::new_from_array(self.actor_key(which_swap_dvp));
-        let nonce_tombstone = Pubkey::new_from_array(self.actor_key(which_nonce_tombstone));
-        let user_a = Pubkey::new_from_array(self.actor_key(which_user_a));
-        let user_b = Pubkey::new_from_array(self.actor_key(which_user_b));
-        let mint_a = Pubkey::new_from_array(self.actor_key(which_mint_a));
-        let mint_b = Pubkey::new_from_array(self.actor_key(which_mint_b));
-        let dvp_ata_a = Pubkey::new_from_array(self.actor_key(which_dvp_ata_a));
-        let dvp_ata_b = Pubkey::new_from_array(self.actor_key(which_dvp_ata_b));
-        let token_program_a = Self::TOKEN_PROGRAM;
-        let token_program_b = Self::TOKEN_PROGRAM;
+        let token_program_b = if which_token_program_b % 2 == 0 {
+            Self::TOKEN_PROGRAM
+        } else {
+            Self::TOKEN_PROGRAM_2022
+        };
+
+        // When which_swap_dvp is even, derive real PDAs from the instruction
+        // args so the transaction can actually land. Otherwise use random actor
+        // keys to exercise the InvalidSeeds rejection path.
+        let (mint_a, mint_b, swap_dvp, nonce_tombstone, dvp_ata_a, dvp_ata_b) =
+            if which_swap_dvp % 2 == 0 {
+                let ma = if !self.mints.is_empty() {
+                    self.mints[which_mint_a as usize % self.mints.len()]
+                } else {
+                    Pubkey::new_from_array(self.actor_key(which_mint_a))
+                };
+                let mb = if self.mints.len() >= 2 {
+                    self.mints[(which_mint_b as usize + 1) % self.mints.len()]
+                } else {
+                    Pubkey::new_from_array(self.actor_key(which_mint_b))
+                };
+                let (dvp, _bump) = Self::derive_swap_dvp(
+                    &self.program_id,
+                    &settlement_authority_pubkey,
+                    &user_a,
+                    &user_b,
+                    &ma,
+                    &mb,
+                    nonce,
+                );
+                let (tomb, _) =
+                    Pubkey::find_program_address(&[b"nonce", dvp.as_ref()], &self.program_id);
+                let ata_a = Self::derive_ata_with_program(&dvp, &ma, &token_program_a);
+                let ata_b = Self::derive_ata_with_program(&dvp, &mb, &token_program_b);
+                (ma, mb, dvp, tomb, ata_a, ata_b)
+            } else {
+                // Random addresses — exercise rejection paths (InvalidSeeds, etc.)
+                let ma = Pubkey::new_from_array(self.actor_key(which_mint_a));
+                let mb = Pubkey::new_from_array(self.actor_key(which_mint_b));
+                let dvp = Pubkey::new_from_array(self.actor_key(which_swap_dvp));
+                let tomb = Pubkey::new_from_array(self.actor_key(which_nonce_tombstone));
+                let ata_a = Pubkey::new_from_array(self.actor_key(which_dvp_ata_a));
+                let ata_b = Pubkey::new_from_array(self.actor_key(which_dvp_ata_b));
+                (ma, mb, dvp, tomb, ata_a, ata_b)
+            };
         let associated_token_program = Self::ATA_PROGRAM;
         self.watch(payer.pubkey());
         self.watch(swap_dvp);
         self.watch(nonce_tombstone);
-        self.watch(settlement_authority.pubkey());
+        self.watch(settlement_authority_pubkey);
         self.watch(user_a);
         self.watch(user_b);
         self.watch(mint_a);
@@ -1889,7 +649,7 @@ impl DvpSwapProgramFixture {
             ("payer", payer.pubkey()),
             ("swap_dvp", swap_dvp),
             ("nonce_tombstone", nonce_tombstone),
-            ("settlement_authority", settlement_authority.pubkey()),
+            ("settlement_authority", settlement_authority_pubkey),
             ("user_a", user_a),
             ("user_b", user_b),
             ("mint_a", mint_a),
@@ -1907,7 +667,7 @@ impl DvpSwapProgramFixture {
                 payer.pubkey(),
                 swap_dvp,
                 nonce_tombstone,
-                settlement_authority.pubkey(),
+                settlement_authority_pubkey,
                 user_a,
                 user_b,
                 mint_a,
@@ -1965,11 +725,27 @@ impl DvpSwapProgramFixture {
                 return false;
             }
         };
-        let swap_dvp = Pubkey::new_from_array(self.actor_key(which_swap_dvp));
-        let mint = Pubkey::new_from_array(self.actor_key(which_mint));
-        let dvp_source_ata = Pubkey::new_from_array(self.actor_key(which_dvp_source_ata));
-        let signer_dest_ata = Pubkey::new_from_array(self.actor_key(which_signer_dest_ata));
-        let token_program = Self::TOKEN_PROGRAM;
+        let (swap_dvp, mint, dvp_source_ata, token_program, signer_dest_ata) =
+            if which_swap_dvp % 4 == 0 && !self.dvps.is_empty() {
+                let d = &self.dvps[which_swap_dvp as usize % self.dvps.len()];
+                // signer determines which leg
+                let (m, ata, tp) = if signer.pubkey() == d.user_a {
+                    (d.mint_a, d.dvp_ata_a, d.token_program_a)
+                } else {
+                    (d.mint_b, d.dvp_ata_b, d.token_program_b)
+                };
+                let dest = Self::derive_ata_with_program(&signer.pubkey(), &m, &tp);
+                (d.swap_dvp, m, ata, tp, dest)
+            } else {
+                (
+                    Pubkey::new_from_array(self.actor_key(which_swap_dvp)),
+                    Pubkey::new_from_array(self.actor_key(which_mint)),
+                    Pubkey::new_from_array(self.actor_key(which_dvp_source_ata)),
+                    Self::TOKEN_PROGRAM,
+                    Pubkey::new_from_array(self.actor_key(which_signer_dest_ata)),
+                )
+            };
+
         let memo_program = Self::MEMO_PROGRAM;
         self.watch(signer.pubkey());
         self.watch(swap_dvp);
@@ -2044,19 +820,50 @@ impl DvpSwapProgramFixture {
                 return false;
             }
         };
-        let swap_dvp = Pubkey::new_from_array(self.actor_key(which_swap_dvp));
-        let mint_a = Pubkey::new_from_array(self.actor_key(which_mint_a));
-        let mint_b = Pubkey::new_from_array(self.actor_key(which_mint_b));
-        let dvp_ata_a = Pubkey::new_from_array(self.actor_key(which_dvp_ata_a));
-        let dvp_ata_b = Pubkey::new_from_array(self.actor_key(which_dvp_ata_b));
-        let user_a_destination_ata_b =
-            Pubkey::new_from_array(self.actor_key(which_user_a_destination_ata_b));
-        let user_b_destination_ata_a =
-            Pubkey::new_from_array(self.actor_key(which_user_b_destination_ata_a));
-        let user_a_ata_a = Pubkey::new_from_array(self.actor_key(which_user_a_ata_a));
-        let user_b_ata_b = Pubkey::new_from_array(self.actor_key(which_user_b_ata_b));
-        let token_program_a = Self::TOKEN_PROGRAM;
-        let token_program_b = Self::TOKEN_PROGRAM;
+        let (swap_dvp, mint_a, mint_b, dvp_ata_a, dvp_ata_b, token_program_a, token_program_b) =
+            if which_swap_dvp % 4 == 0 && !self.dvps.is_empty() {
+                let d = &self.dvps[which_swap_dvp as usize % self.dvps.len()];
+                (
+                    d.swap_dvp,
+                    d.mint_a,
+                    d.mint_b,
+                    d.dvp_ata_a,
+                    d.dvp_ata_b,
+                    d.token_program_a,
+                    d.token_program_b,
+                )
+            } else {
+                (
+                    Pubkey::new_from_array(self.actor_key(which_swap_dvp)),
+                    Pubkey::new_from_array(self.actor_key(which_mint_a)),
+                    Pubkey::new_from_array(self.actor_key(which_mint_b)),
+                    Pubkey::new_from_array(self.actor_key(which_dvp_ata_a)),
+                    Pubkey::new_from_array(self.actor_key(which_dvp_ata_b)),
+                    Self::TOKEN_PROGRAM,
+                    Self::TOKEN_PROGRAM,
+                )
+            };
+        // When a real dvp record is selected, derive destination ATAs correctly
+        // so the instruction can actually pass the canonicality checks. Otherwise
+        // use random actor keys to exercise the rejection paths.
+        let (user_a_destination_ata_b, user_b_destination_ata_a, user_a_ata_a, user_b_ata_b) =
+            if which_swap_dvp % 4 == 0 && !self.dvps.is_empty() {
+                let d = &self.dvps[which_swap_dvp as usize % self.dvps.len()];
+                (
+                    Self::derive_ata_with_program(&d.user_a, &d.mint_b, &d.token_program_b),
+                    Self::derive_ata_with_program(&d.user_b, &d.mint_a, &d.token_program_a),
+                    Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a),
+                    Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b),
+                )
+            } else {
+                (
+                    Pubkey::new_from_array(self.actor_key(which_user_a_destination_ata_b)),
+                    Pubkey::new_from_array(self.actor_key(which_user_b_destination_ata_a)),
+                    Pubkey::new_from_array(self.actor_key(which_user_a_ata_a)),
+                    Pubkey::new_from_array(self.actor_key(which_user_b_ata_b)),
+                )
+            };
+
         let memo_program = Self::MEMO_PROGRAM;
         self.watch(settlement_authority.pubkey());
         self.watch(swap_dvp);
@@ -2145,7 +952,7 @@ impl DvpSwapProgramFixture {
         which_token_program_a: u64,
         which_token_program_b: u64,
         which_memo_program: u64,
-        leg_a_extras_count: u8,
+        #[range(0..4)] leg_a_extras_count: u8,
     ) -> bool {
         let settlement_authority = match self.actor(which_settlement_authority) {
             Some(actor) => actor,
@@ -2154,15 +961,43 @@ impl DvpSwapProgramFixture {
                 return false;
             }
         };
-        let swap_dvp = Pubkey::new_from_array(self.actor_key(which_swap_dvp));
-        let mint_a = Pubkey::new_from_array(self.actor_key(which_mint_a));
-        let mint_b = Pubkey::new_from_array(self.actor_key(which_mint_b));
-        let dvp_ata_a = Pubkey::new_from_array(self.actor_key(which_dvp_ata_a));
-        let dvp_ata_b = Pubkey::new_from_array(self.actor_key(which_dvp_ata_b));
-        let user_a_ata_a = Pubkey::new_from_array(self.actor_key(which_user_a_ata_a));
-        let user_b_ata_b = Pubkey::new_from_array(self.actor_key(which_user_b_ata_b));
-        let token_program_a = Self::TOKEN_PROGRAM;
-        let token_program_b = Self::TOKEN_PROGRAM;
+        let (
+            swap_dvp,
+            mint_a,
+            mint_b,
+            dvp_ata_a,
+            dvp_ata_b,
+            token_program_a,
+            token_program_b,
+            user_a_ata_a,
+            user_b_ata_b,
+        ) = if which_swap_dvp % 4 == 0 && !self.dvps.is_empty() {
+            let d = &self.dvps[which_swap_dvp as usize % self.dvps.len()];
+            (
+                d.swap_dvp,
+                d.mint_a,
+                d.mint_b,
+                d.dvp_ata_a,
+                d.dvp_ata_b,
+                d.token_program_a,
+                d.token_program_b,
+                Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a),
+                Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b),
+            )
+        } else {
+            (
+                Pubkey::new_from_array(self.actor_key(which_swap_dvp)),
+                Pubkey::new_from_array(self.actor_key(which_mint_a)),
+                Pubkey::new_from_array(self.actor_key(which_mint_b)),
+                Pubkey::new_from_array(self.actor_key(which_dvp_ata_a)),
+                Pubkey::new_from_array(self.actor_key(which_dvp_ata_b)),
+                Self::TOKEN_PROGRAM,
+                Self::TOKEN_PROGRAM,
+                Pubkey::new_from_array(self.actor_key(which_user_a_ata_a)),
+                Pubkey::new_from_array(self.actor_key(which_user_b_ata_b)),
+            )
+        };
+
         let memo_program = Self::MEMO_PROGRAM;
         self.watch(settlement_authority.pubkey());
         self.watch(swap_dvp);
@@ -2245,7 +1080,7 @@ impl DvpSwapProgramFixture {
         which_token_program_a: u64,
         which_token_program_b: u64,
         which_memo_program: u64,
-        leg_a_extras_count: u8,
+        #[range(0..4)] leg_a_extras_count: u8,
     ) -> bool {
         let signer = match self.actor(which_signer) {
             Some(actor) => actor,
@@ -2254,15 +1089,43 @@ impl DvpSwapProgramFixture {
                 return false;
             }
         };
-        let swap_dvp = Pubkey::new_from_array(self.actor_key(which_swap_dvp));
-        let mint_a = Pubkey::new_from_array(self.actor_key(which_mint_a));
-        let mint_b = Pubkey::new_from_array(self.actor_key(which_mint_b));
-        let dvp_ata_a = Pubkey::new_from_array(self.actor_key(which_dvp_ata_a));
-        let dvp_ata_b = Pubkey::new_from_array(self.actor_key(which_dvp_ata_b));
-        let user_a_ata_a = Pubkey::new_from_array(self.actor_key(which_user_a_ata_a));
-        let user_b_ata_b = Pubkey::new_from_array(self.actor_key(which_user_b_ata_b));
-        let token_program_a = Self::TOKEN_PROGRAM;
-        let token_program_b = Self::TOKEN_PROGRAM;
+        let (
+            swap_dvp,
+            mint_a,
+            mint_b,
+            dvp_ata_a,
+            dvp_ata_b,
+            token_program_a,
+            token_program_b,
+            user_a_ata_a,
+            user_b_ata_b,
+        ) = if which_swap_dvp % 4 == 0 && !self.dvps.is_empty() {
+            let d = &self.dvps[which_swap_dvp as usize % self.dvps.len()];
+            (
+                d.swap_dvp,
+                d.mint_a,
+                d.mint_b,
+                d.dvp_ata_a,
+                d.dvp_ata_b,
+                d.token_program_a,
+                d.token_program_b,
+                Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a),
+                Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b),
+            )
+        } else {
+            (
+                Pubkey::new_from_array(self.actor_key(which_swap_dvp)),
+                Pubkey::new_from_array(self.actor_key(which_mint_a)),
+                Pubkey::new_from_array(self.actor_key(which_mint_b)),
+                Pubkey::new_from_array(self.actor_key(which_dvp_ata_a)),
+                Pubkey::new_from_array(self.actor_key(which_dvp_ata_b)),
+                Self::TOKEN_PROGRAM,
+                Self::TOKEN_PROGRAM,
+                Pubkey::new_from_array(self.actor_key(which_user_a_ata_a)),
+                Pubkey::new_from_array(self.actor_key(which_user_b_ata_b)),
+            )
+        };
+
         let memo_program = Self::MEMO_PROGRAM;
         self.watch(signer.pubkey());
         self.watch(swap_dvp);
@@ -2347,8 +1210,34 @@ impl DvpSwapProgramFixture {
         user_b_actor: u64,
         mint_a_actor: u64,
         mint_b_actor: u64,
-        nonce: u64,
+        #[range(0..16)] nonce: u64,
     ) -> bool {
+        // Add a small probability path that derives real addresses from the instruction data:
+        let (swap_dvp, nonce_tombstone) = if which_swap_dvp % 4 == 0 {
+            // Derive real PDA from the seed inputs so we get past InvalidSeeds
+            let nonce_bytes = (nonce % 16).to_le_bytes();
+            let derived = Pubkey::find_program_address(
+                &[
+                    b"dvp",
+                    self.actor_key(settlement_authority_actor).as_ref(),
+                    self.actor_key(user_a_actor).as_ref(),
+                    self.actor_key(user_b_actor).as_ref(),
+                    self.actor_key(mint_a_actor).as_ref(),
+                    self.actor_key(mint_b_actor).as_ref(),
+                    &nonce_bytes,
+                ],
+                &self.program_id,
+            )
+            .0;
+            let tombstone =
+                Pubkey::find_program_address(&[b"nonce", derived.as_ref()], &self.program_id).0;
+            (derived, tombstone)
+        } else {
+            (
+                Pubkey::new_from_array(self.actor_key(which_swap_dvp)),
+                Pubkey::new_from_array(self.actor_key(which_nonce_tombstone)),
+            )
+        };
         let signer = match self.actor(which_signer) {
             Some(actor) => actor,
             None => {
@@ -2356,9 +1245,16 @@ impl DvpSwapProgramFixture {
                 return false;
             }
         };
-        let swap_dvp = Pubkey::new_from_array(self.actor_key(which_swap_dvp));
-        let nonce_tombstone = Pubkey::new_from_array(self.actor_key(which_nonce_tombstone));
-        let mint = Pubkey::new_from_array(self.actor_key(which_mint));
+        let mut mint = Pubkey::new_from_array(self.actor_key(mint_a_actor));
+        if which_swap_dvp % 4 == 0 {
+            mint = if signer.pubkey() == Pubkey::new_from_array(self.actor_key(user_a_actor)) {
+                Pubkey::new_from_array(self.actor_key(mint_a_actor))
+            } else {
+                Pubkey::new_from_array(self.actor_key(mint_b_actor))
+            };
+            // use this mint instead of actor_key(which_mint)
+        }
+
         let dvp_escrow_ata = Pubkey::new_from_array(self.actor_key(which_dvp_escrow_ata));
         let signer_dest_ata = Pubkey::new_from_array(self.actor_key(which_signer_dest_ata));
         let token_program = Self::TOKEN_PROGRAM;
@@ -2383,7 +1279,7 @@ impl DvpSwapProgramFixture {
                 ("user_b_actor", user_b_actor as u128),
                 ("mint_a_actor", mint_a_actor as u128),
                 ("mint_b_actor", mint_b_actor as u128),
-                ("nonce", nonce as u128),
+                ("nonce", (nonce % 16) as u128),
             ],
         );
         self.last.accounts = vec![
@@ -2413,7 +1309,7 @@ impl DvpSwapProgramFixture {
                 self.actor_key(user_b_actor),
                 self.actor_key(mint_a_actor),
                 self.actor_key(mint_b_actor),
-                nonce,
+                nonce % 16,
             ))
             .signers(&[&*signer])
             .send();
@@ -2453,7 +1349,7 @@ impl DvpSwapProgramFixture {
             wi = (wi + 1) % n;
         }
         let wrong_auth = self.actors[wi as usize].clone();
-        // ATAs use swapped mints so use swapped token programs
+
         let ua_a = Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a);
         let ub_b = Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b);
         self.snapshot();
@@ -2552,8 +1448,7 @@ impl DvpSwapProgramFixture {
             Some(k) => k.clone(),
             None => return false,
         };
-        // derive ATAs with swapped mints
-        // ATAs use swapped mints so use swapped token programs
+
         let ua_b = Self::derive_ata_with_program(&d.user_a, &d.mint_b, &d.token_program_b);
         let ub_a = Self::derive_ata_with_program(&d.user_b, &d.mint_a, &d.token_program_a);
         self.snapshot();
@@ -2669,7 +1564,102 @@ impl DvpSwapProgramFixture {
         }
         moved
     }
-
+    /*
+        // reject version — signer is user_a
+        pub fn action_MODEL_reject_swapped_mints(&mut self, which_dvp: u64) -> bool {
+            if self.dvps.is_empty() {
+                note_blocked("reject_swapped_mints", -1, &"no dvps yet");
+                return false;
+            }
+            let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
+            let user_a = match self.actors.iter().find(|k| k.pubkey() == d.user_a) {
+                Some(k) => k.clone(),
+                None => return false,
+            };
+            let ua_a = Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a);
+            let ub_b = Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b);
+            self.snapshot();
+            self.last = Action::new("reject_swapped_mints", vec![]);
+            let outcome = self
+                .ctx
+                .raw_call(build_reject_dvp_ix(
+                    self.program_id,
+                    d.user_a,
+                    d.swap_dvp,
+                    d.mint_b, // ← swapped
+                    d.mint_a, // ← swapped
+                    d.dvp_ata_a,
+                    d.dvp_ata_b,
+                    ua_a,
+                    ub_b,
+                    d.token_program_b, // ← swapped
+                    d.token_program_a, // ← swapped
+                    Self::MEMO_PROGRAM,
+                    0,
+                ))
+                .signers(&[&*user_a])
+                .send();
+            self.last.ok = outcome.as_ref().map(|o| o.is_success()).unwrap_or(false);
+            note_blocked(
+                "reject_swapped_mints",
+                match outcome.as_ref() {
+                    Ok(o) => o.error_code().map(|c| c as i64).unwrap_or(-2),
+                    Err(_) => -1,
+                },
+                &outcome,
+            );
+            false
+        }
+    */
+    // settle version — signer is authority
+    pub fn action_MODEL_settle_swapped_mints(&mut self, which_dvp: u64) -> bool {
+        if self.dvps.is_empty() {
+            note_blocked("settle_swapped_mints", -1, &"no dvps yet");
+            return false;
+        }
+        let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
+        let authority = match self.actors.iter().find(|k| k.pubkey() == d.authority) {
+            Some(k) => k.clone(),
+            None => return false,
+        };
+        let ua_b = Self::derive_ata_with_program(&d.user_a, &d.mint_b, &d.token_program_b);
+        let ub_a = Self::derive_ata_with_program(&d.user_b, &d.mint_a, &d.token_program_a);
+        let ua_a = Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a);
+        let ub_b = Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b);
+        self.snapshot();
+        self.last = Action::new("settle_swapped_mints", vec![]);
+        let outcome = self
+            .ctx
+            .raw_call(build_settle_dvp_ix(
+                self.program_id,
+                d.authority,
+                d.swap_dvp,
+                d.mint_b, // ← swapped
+                d.mint_a, // ← swapped
+                d.dvp_ata_a,
+                d.dvp_ata_b,
+                ua_b,
+                ub_a,
+                ua_a,
+                ub_b,
+                d.token_program_b, // ← swapped
+                d.token_program_a, // ← swapped
+                Self::MEMO_PROGRAM,
+                0,
+            ))
+            .signers(&[&*authority])
+            .send();
+        self.last.ok = outcome.as_ref().map(|o| o.is_success()).unwrap_or(false);
+        note_blocked(
+            "settle_swapped_mints",
+            match outcome.as_ref() {
+                Ok(o) => o.error_code().map(|c| c as i64).unwrap_or(-2),
+                Err(_) => -1,
+            },
+            &outcome,
+        );
+        false
+    }
     /// Not in the IDL. Keep it if the program reads Clock.
     #[allow(non_snake_case)] //range was too small for some tests, so I increased it to 500_000
     pub fn action_RUNTIME_warp_slots(&mut self, #[range(1..500_000)] slots: u64) -> bool {
@@ -2724,16 +1714,15 @@ impl DvpSwapProgramFixture {
                 self.watch(mint);
             }
         }
-        for i in 0..2u8 {
-            let mint = Pubkey::new_from_array([102u8 + i; 32]);
+        // Ensure every mint already in self.mints (SPL or T22, including
+        // blocked mints) is watched and deduplicated — no separate fields needed.
+        for &mint in &self.mints.clone() {
             if self
                 .ctx
                 .get_account(&mint)
                 .map(|a| a.data.len() >= 82)
                 .unwrap_or(false)
-                && !self.mints.contains(&mint)
             {
-                self.mints.push(mint);
                 self.watch(mint);
             }
         }
@@ -2751,7 +1740,61 @@ impl DvpSwapProgramFixture {
         }
         self.last.ok
     }
-
+    //added:mubariz
+    #[allow(non_snake_case)]
+    pub fn action_MODEL_settle_expired(&mut self, which_dvp: u64) -> bool {
+        if self.dvps.is_empty() {
+            note_blocked("settle_expired", -1, &"no dvps yet");
+            return false;
+        }
+        let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
+        let authority = match self.actors.iter().find(|k| k.pubkey() == d.authority) {
+            Some(k) => k.clone(),
+            None => return false,
+        };
+        // Warp well past expiry. The SVM clock advances ~0.4 s per slot, so
+        // 365 days = 31_536_000 s needs ~78_840_000 slots. Use 80_000_000 to
+        // guarantee unix_now() > expiry_timestamp for any DVP in the fixture.
+        let next = self.ctx.slot() + 80_000_000;
+        self.ctx.warp_to_slot(next);
+        let ua_b = Self::derive_ata_with_program(&d.user_a, &d.mint_b, &d.token_program_b);
+        let ub_a = Self::derive_ata_with_program(&d.user_b, &d.mint_a, &d.token_program_a);
+        let ua_a = Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a);
+        let ub_b = Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b);
+        self.snapshot();
+        self.last = Action::new("settle_expired", vec![]);
+        let outcome = self
+            .ctx
+            .raw_call(build_settle_dvp_ix(
+                self.program_id,
+                d.authority,
+                d.swap_dvp,
+                d.mint_a,
+                d.mint_b,
+                d.dvp_ata_a,
+                d.dvp_ata_b,
+                ua_b,
+                ub_a,
+                ua_a,
+                ub_b,
+                d.token_program_a,
+                d.token_program_b,
+                Self::MEMO_PROGRAM,
+                0,
+            ))
+            .signers(&[&*authority])
+            .send();
+        self.last.ok = outcome.as_ref().map(|o| o.is_success()).unwrap_or(false);
+        note_blocked(
+            "settle_expired",
+            match outcome.as_ref() {
+                Ok(o) => o.error_code().map(|c| c as i64).unwrap_or(-2),
+                Err(_) => -1,
+            },
+            &outcome,
+        );
+        false
+    }
     pub fn action_MODEL_create_dvp_real(
         &mut self,
         which_payer: u64,
@@ -2761,10 +1804,11 @@ impl DvpSwapProgramFixture {
         #[range(1..1_000_000)] amount_a: u64,
         #[range(1..1_000_000)] amount_b: u64,
         #[range(60..(365 * 24 * 60 * 60))] expiry_delta: i64,
-        #[range(0..8)] nonce: u64,
+        #[range(0..16)] nonce: u64,
         which_token_program: u64,
         user_a_dest_present: u64,
         user_b_dest_present: u64,
+        earliest_settlement_timestamp: Option<i64>,
     ) -> bool {
         if self.actors.len() < 3 || self.mints.len() < 2 {
             note_blocked("create_dvp_real", -1, &"low actors or mints ");
@@ -2858,7 +1902,7 @@ impl DvpSwapProgramFixture {
         } else {
             None
         };
-        let user_b_dest = if user_b_dest_present % 2 == 0 {
+        let user_b_dest = if user_b_dest_present % 2 == 1 {
             Some(self.actor_key(which_user_b)) // pass user_b as their own destination
         } else {
             None
@@ -2887,7 +1931,7 @@ impl DvpSwapProgramFixture {
                 None,
                 user_a_dest,
                 user_b_dest,
-                None,
+                earliest_settlement_timestamp,
             ))
             .signers(&[&*payer])
             .send();
@@ -2938,7 +1982,7 @@ impl DvpSwapProgramFixture {
         #[range(0..4_000_000)] extra: u64,
     ) -> bool {
         if self.dvps.is_empty() {
-            note_blocked("fund_legs", -1, &"no closed dvps yet");
+            note_blocked("fund_legs", -1, &"no  dvps yet");
             return false;
         }
         let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
@@ -3031,6 +2075,23 @@ impl DvpSwapProgramFixture {
             return false;
         }
         let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
+        // Guard: swap_dvp must still be program-owned (not already settled/rejected).
+        if !self
+            .ctx
+            .get_account(&d.swap_dvp)
+            .map(|a| !a.data.is_empty())
+            .unwrap_or(false)
+        {
+            note_blocked("settle_real", -1, &"swap_dvp already closed");
+            return false;
+        }
+        // Guard: both escrows must hold at least the agreed amounts.
+        let bal_a = self.token_amount(&d.dvp_ata_a).unwrap_or(0);
+        let bal_b = self.token_amount(&d.dvp_ata_b).unwrap_or(0);
+        if bal_a < d.amount_a || bal_b < d.amount_b {
+            note_blocked("settle_real", -1, &"leg not funded");
+            return false;
+        }
         let authority = match self.actors.iter().find(|k| k.pubkey() == d.authority) {
             Some(k) => k.clone(),
             None => {
@@ -3136,7 +2197,7 @@ impl DvpSwapProgramFixture {
         self.last.ok = outcome.as_ref().map(|o| o.is_success()).unwrap_or(false);
         if self.last.ok {
             note_landed("settle_real");
-            // self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
+            self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
         } else {
             note_blocked(
                 "settle_real",
@@ -3159,11 +2220,20 @@ impl DvpSwapProgramFixture {
             return false;
         }
         let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
+        // Guard: swap_dvp must still be program-owned.
+        if !self
+            .ctx
+            .get_account(&d.swap_dvp)
+            .map(|a| !a.data.is_empty())
+            .unwrap_or(false)
+        {
+            note_blocked("cancel_real", -1, &"swap_dvp already closed");
+            return false;
+        }
         let authority = match self.actors.iter().find(|k| k.pubkey() == d.authority) {
             Some(k) => k.clone(),
             None => {
                 note_blocked("cancel_real", -1, &"authority keypair not found");
-
                 return false;
             }
         };
@@ -3209,7 +2279,7 @@ impl DvpSwapProgramFixture {
         self.last.ok = outcome.as_ref().map(|o| o.is_success()).unwrap_or(false);
         if self.last.ok {
             note_landed("cancel_real");
-            //   self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
+            self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
         } else {
             note_blocked(
                 "cancel_real",
@@ -3251,8 +2321,8 @@ impl DvpSwapProgramFixture {
         );
         let (tombstone, _) =
             Pubkey::find_program_address(&[b"nonce", swap_dvp.as_ref()], &self.program_id);
-        let dvp_ata_a = Self::derive_ata(&swap_dvp, &mint_a);
-        let dvp_ata_b = Self::derive_ata(&swap_dvp, &mint_b);
+        let dvp_ata_a = Self::derive_ata_with_program(&swap_dvp, &mint_a, &Self::TOKEN_PROGRAM);
+        let dvp_ata_b = Self::derive_ata_with_program(&swap_dvp, &mint_b, &Self::TOKEN_PROGRAM);
 
         // Skip if already exists
         if self
@@ -3297,8 +2367,8 @@ impl DvpSwapProgramFixture {
 
         if self.last.ok {
             // Fund it via real SPL transfers
-            let ua_a = Self::derive_ata(&user_a, &mint_a);
-            let ub_b = Self::derive_ata(&user_b, &mint_b);
+            let ua_a = Self::derive_ata_with_program(&user_a, &mint_a, &Self::TOKEN_PROGRAM);
+            let ub_b = Self::derive_ata_with_program(&user_b, &mint_b, &Self::TOKEN_PROGRAM);
             for (owner, mint, ata) in [(user_a, mint_a, ua_a), (user_b, mint_b, ub_b)] {
                 if !self
                     .ctx
@@ -3484,7 +2554,7 @@ impl DvpSwapProgramFixture {
         self.last.ok = outcome.as_ref().map(|o| o.is_success()).unwrap_or(false);
         if self.last.ok {
             note_landed("reject_real");
-            //   self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
+            self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
         } else {
             note_blocked(
                 "reject_real",
@@ -3507,6 +2577,16 @@ impl DvpSwapProgramFixture {
             return false;
         }
         let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
+        // Guard: swap_dvp must still be program-owned.
+        if !self
+            .ctx
+            .get_account(&d.swap_dvp)
+            .map(|a| !a.data.is_empty())
+            .unwrap_or(false)
+        {
+            note_blocked("reclaim_real", -1, &"swap_dvp already closed");
+            return false;
+        }
         let a_side = which_party % 2 == 0;
         let party = if a_side { d.user_a } else { d.user_b };
         let mint = if a_side { d.mint_a } else { d.mint_b };
@@ -3937,8 +3017,8 @@ impl DvpSwapProgramFixture {
         );
         let (tombstone, _tb) =
             Pubkey::find_program_address(&[b"nonce", swap_dvp.as_ref()], &self.program_id);
-        let dvp_ata_a = Self::derive_ata(&swap_dvp, &mint_a);
-        let dvp_ata_b = Self::derive_ata(&swap_dvp, &mint_b);
+        let dvp_ata_a = Self::derive_ata_with_program(&swap_dvp, &mint_a, &token_program);
+        let dvp_ata_b = Self::derive_ata_with_program(&swap_dvp, &mint_b, &token_program);
         for k in [
             payer.pubkey(),
             swap_dvp,
@@ -4186,8 +3266,8 @@ impl DvpSwapProgramFixture {
                 return false;
             }
         };
-        let ua_b = Self::derive_ata(&d.user_a, &d.mint_b);
-        let ub_a = Self::derive_ata(&d.user_b, &d.mint_a);
+        let ua_b = Self::derive_ata_with_program(&d.user_a, &d.mint_b, &d.token_program_a);
+        let ub_a = Self::derive_ata_with_program(&d.user_b, &d.mint_a, &d.token_program_b);
         self.snapshot();
         self.last = Action::new("reject_swapped_mints", vec![]);
         let outcome = self
@@ -4234,6 +3314,16 @@ impl DvpSwapProgramFixture {
             return false;
         }
         let d = self.dvps[(which_dvp as usize) % self.dvps.len()].clone();
+        // Guard: swap_dvp must still be program-owned.
+        if !self
+            .ctx
+            .get_account(&d.swap_dvp)
+            .map(|a| !a.data.is_empty())
+            .unwrap_or(false)
+        {
+            note_blocked("close_dvp_for_recover", -1, &"swap_dvp already closed");
+            return false;
+        }
         let signer = match self.actors.iter().find(|k| k.pubkey() == d.user_a) {
             Some(k) => k.clone(),
             None => {
@@ -4325,29 +3415,48 @@ impl DvpSwapProgramFixture {
         }
         note_landed("close_dvp_for_recover");
         // The SwapDvp is now system-owned and empty; the tombstone survives.
-        //    self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
+        self.dvps.retain(|x| x.swap_dvp != d.swap_dvp);
         if !self.closed.iter().any(|x| x.swap_dvp == d.swap_dvp) && self.closed.len() < 8 {
             self.closed.push(d.clone());
         }
         // Recreate BOTH escrow ATAs for the dead PDA, as a late deposit would:
         // reject closed them, so they no longer exist. Owner is the (now
-        // system-owned) swap_dvp PDA, which is exactly what the ATA program
-        // would have produced.
-        for (mint, escrow) in [(d.mint_a, d.dvp_ata_a), (d.mint_b, d.dvp_ata_b)] {
+        // system-owned) swap_dvp PDA. Use the DVP's actual token program per
+        // leg so recover_real can match the escrow's account owner correctly.
+        for (mint, escrow, token_prog) in [
+            (d.mint_a, d.dvp_ata_a, d.token_program_a),
+            (d.mint_b, d.dvp_ata_b, d.token_program_b),
+        ] {
             if !self
                 .ctx
                 .get_account(&escrow)
                 .map(|a| a.data.len() >= 72)
                 .unwrap_or(false)
             {
-                let _ = self
-                    .ctx
-                    .create_token_account()
-                    .pubkey(escrow)
-                    .mint(mint)
-                    .token_owner(d.swap_dvp)
-                    .amount(preload)
-                    .create();
+                if token_prog == Self::TOKEN_PROGRAM_2022 {
+                    let mut data = vec![0u8; 165];
+                    data[0..32].copy_from_slice(&mint.to_bytes());
+                    data[32..64].copy_from_slice(&d.swap_dvp.to_bytes());
+                    data[64..72].copy_from_slice(&preload.to_le_bytes());
+                    data[108] = 1; // is_initialized
+                    let account = solana_account::Account {
+                        lamports: 2_039_280,
+                        data,
+                        owner: Self::TOKEN_PROGRAM_2022,
+                        executable: false,
+                        rent_epoch: u64::MAX,
+                    };
+                    let _ = self.ctx.svm.set_account(escrow, account.into());
+                } else {
+                    let _ = self
+                        .ctx
+                        .create_token_account()
+                        .pubkey(escrow)
+                        .mint(mint)
+                        .token_owner(d.swap_dvp)
+                        .amount(preload)
+                        .create();
+                }
             }
             self.watch(escrow);
         }
@@ -4384,10 +3493,10 @@ impl DvpSwapProgramFixture {
         };
 
         // Every ATA both legs and both close paths can touch.
-        let ua_a = Self::derive_ata(&d.user_a, &d.mint_a);
-        let ua_b = Self::derive_ata(&d.user_a, &d.mint_b);
-        let ub_a = Self::derive_ata(&d.user_b, &d.mint_a);
-        let ub_b = Self::derive_ata(&d.user_b, &d.mint_b);
+        let ua_a = Self::derive_ata_with_program(&d.user_a, &d.mint_a, &d.token_program_a);
+        let ua_b = Self::derive_ata_with_program(&d.user_a, &d.mint_b, &d.token_program_b);
+        let ub_a = Self::derive_ata_with_program(&d.user_b, &d.mint_a, &d.token_program_a);
+        let ub_b = Self::derive_ata_with_program(&d.user_b, &d.mint_b, &d.token_program_b);
         for (owner, mint, ata) in [
             (d.user_a, d.mint_a, ua_a),
             (d.user_a, d.mint_b, ua_b),
